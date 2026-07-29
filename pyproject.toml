@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xmind-mcp-server"
+version = "0.1.0"
+description = "让大模型读写 XMind 文件，支持图片 OCR 的 MCP Server"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "GarryWhite", email = "garrywhite@example.com"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=2.0.0",
+    "psutil>=5.9.0",
+    "Pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+rapidocr = [
+    "rapidocr-onnxruntime>=1.2.0",
+    "onnxruntime>=1.16.0",
+]
+paddleocr = [
+    "paddleocr>=2.7.0",
+    "paddlepaddle>=2.6.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+all = [
+    "rapidocr-onnxruntime>=1.2.0",
+    "onnxruntime>=1.16.0",
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[project.scripts]
+xmind-mcp = "xmind_mcp.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/GarryWhite109909/xmind-mcp-server"
+Repository = "https://github.com/GarryWhite109909/xmind-mcp-server"
+Issues = "https://github.com/GarryWhite109909/xmind-mcp-server/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
