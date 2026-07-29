@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -15,6 +16,11 @@ from ..config import Config, CONFIG_DIR
 from .base import OCRBackend, OcrResult, ImageInput
 from .rapidocr_backend import RapidOCRBackend
 from .paddleocr_backend import PaddleOCRBackend
+
+
+def _log(msg: str) -> None:
+    """输出到 stderr，避免污染 MCP 的 stdio 通信。"""
+    print(f"[xmind-mcp/ocr] {msg}", file=sys.stderr, flush=True)
 
 
 CACHE_DB = CONFIG_DIR / "ocr_cache.db"
@@ -136,8 +142,23 @@ class OCRManager:
             self._cache_conn = None
 
     def unload(self) -> None:
-        """释放所有 OCR 资源：关闭缓存 + 卸载模型。"""
-        self.close()
+        """释放所有 OCR 资源：关闭缓存 + 卸载模型。
+
+        幂等：重复调用安全。失败不抛异常，但会记录到 stderr。
+        """
+        if self._cache_conn is not None:
+            try:
+                self._cache_conn.close()
+            except Exception as e:
+                _log(f"关闭缓存数据库失败: {type(e).__name__}: {e}")
+            self._cache_conn = None
+
         if self._backend is not None:
-            self._backend.close()
+            backend_name = type(self._backend).__name__
+            try:
+                _log(f"开始卸载 OCR 模型 ({backend_name})...")
+                self._backend.close()
+                _log(f"OCR 模型已卸载 ({backend_name})")
+            except Exception as e:
+                _log(f"卸载 OCR 模型失败 ({backend_name}): {type(e).__name__}: {e}")
             self._backend = None

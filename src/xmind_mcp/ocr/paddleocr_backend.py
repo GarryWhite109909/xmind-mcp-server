@@ -78,13 +78,46 @@ class PaddleOCRBackend(OCRBackend):
         )
 
     def close(self) -> None:
-        """释放 PaddleOCR / Paddle 占用的内存和显存。"""
+        """释放 PaddleOCR / Paddle 占用的内存和显存。
+
+        关键点：
+        - Paddle 的 GPU 显存由其内部 allocator 池管理，仅 del 模型对象
+          不会把显存还给驱动，必须显式调用 empty_cache()。
+        - PaddleOCR 对象内部持有 text_detector / text_recognizer 等子网络，
+          先把它们置 None 断开引用，再 del 顶层对象，确保 GC 能回收。
+        - 任何一步失败都不阻塞后续清理。
+        """
         if self._ocr is None:
             return
+
+        ocr = self._ocr
+        self._ocr = None
+
+        # 1. 断开 PaddleOCR 内部子网络引用（不同版本属性名不一致，逐个尝试）
+        for attr_name in (
+            "text_detector", "text_recognizer", "angle_classifier",
+            "cls", "det", "rec", "net",
+        ):
+            attr = getattr(ocr, attr_name, None)
+            if attr is not None:
+                try:
+                    setattr(ocr, attr_name, None)
+                except Exception:
+                    pass
+
+        # 2. 删除顶层对象 + 强制 GC
+        del ocr
         try:
             import gc
-            del self._ocr
-            self._ocr = None
             gc.collect()
         except Exception:
             pass
+
+        # 3. 清空 Paddle GPU 显存池（CPU 模式下为 no-op）
+        if self._device == "cuda":
+            try:
+                import paddle
+                paddle.device.cuda.empty_cache()
+            except Exception:
+                # paddle 未安装或非 GPU 版本时忽略
+                pass

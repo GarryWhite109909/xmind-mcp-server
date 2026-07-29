@@ -74,25 +74,39 @@ class RapidOCRBackend(OCRBackend):
         )
 
     def close(self) -> None:
-        """释放 RapidOCR / onnxruntime 占用的内存和显存。"""
+        """释放 RapidOCR / onnxruntime 占用的内存和显存。
+
+        关键点：
+        - RapidOCR 内部含 det/cls/rec 三个独立 InferenceSession，
+          每个 session 在 CUDA/DirectML EP 下都会占显存。
+        - onnxruntime 没有公开的 session.close()，显存释放依赖
+          session 对象被 GC 回收，因此先断开 RapidOCR 对内部 session
+          的所有引用，再 del 顶层对象 + gc.collect()。
+        - 不同 RapidOCR 版本内部属性名不一致，逐个尝试。
+        """
         if self._ocr is None:
             return
 
-        # 尝试释放 onnxruntime 内部 session
-        try:
-            session = getattr(self._ocr, "session", None)
-            if session is not None:
-                # 某些版本有 __del__，显式释放输入输出名引用
-                session._inputs_meta = None
-                session._outputs_meta = None
-                del session
-        except Exception:
-            pass
-
-        del self._ocr
+        ocr = self._ocr
         self._ocr = None
 
-        # 强制触发 Python 垃圾回收，尽快释放显存
+        # 1. 断开 RapidOCR 内部所有 InferenceSession 引用
+        #    （不同版本属性名不同，全部尝试一遍）
+        for attr_name in (
+            "session", "session_det", "session_cls", "session_rec",
+            "text_detector", "text_recognizer", "angle_classifier",
+            "det", "cls", "rec",
+        ):
+            attr = getattr(ocr, attr_name, None)
+            if attr is not None:
+                try:
+                    setattr(ocr, attr_name, None)
+                except Exception:
+                    pass
+
+        # 2. 删除顶层对象 + 强制 GC
+        #    onnxruntime 的 InferenceSession 在被 GC 时会释放底层显存
+        del ocr
         try:
             import gc
             gc.collect()
