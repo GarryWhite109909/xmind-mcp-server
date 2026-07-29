@@ -58,12 +58,39 @@ async def test_read_structure(config: Config, sample_xmind: Path):
     assert len(result) == 1
     assert "根主题" in result[0].text
     assert "子节点1" in result[0].text
+    # 默认输出 ID
+    assert "[id: root-1]" in result[0].text
+    assert "[id: child-1]" in result[0].text
+
+
+async def test_read_structure_clean(config: Config, sample_xmind: Path):
+    tools = XMindTools(config)
+    result = await tools.call_tool("read_structure", {
+        "file_path": str(sample_xmind),
+        "clean": True,
+        "include_ids": False,
+    })
+    text = result[0].text
+    assert "根主题" in text
+    assert "[id:" not in text
+    assert "🔖" not in text
+
+
+async def test_read_structure_newline_title(config: Config, sample_xmind: Path):
+    """标题中的换行应被清理为单个空格。"""
+    tools = XMindTools(config)
+    # 手动构造一个带换行的节点
+    xm, writer = tools.workspace.get(str(sample_xmind))
+    writer.add_node(parent_id="root-1", title="第一行\n第二行")
+    result = await tools.call_tool("read_structure", {"file_path": str(sample_xmind)})
+    assert "第一行 第二行" in result[0].text
 
 
 async def test_list_images(config: Config, xmind_with_image: Path):
     tools = XMindTools(config)
     result = await tools.call_tool("list_images", {"file_path": str(xmind_with_image)})
     assert "图片节点" in result[0].text
+    assert "img-node" in result[0].text
 
 
 async def test_read_image_ocr(config: Config, xmind_with_image: Path):
@@ -73,6 +100,27 @@ async def test_read_image_ocr(config: Config, xmind_with_image: Path):
         "node_id": "img-node",
     })
     assert "OCR" in result[0].text
+
+
+async def test_find_node(config: Config, sample_xmind: Path):
+    tools = XMindTools(config)
+    result = await tools.call_tool("find_node", {
+        "file_path": str(sample_xmind),
+        "keyword": "子节点1",
+    })
+    text = result[0].text
+    assert "child-1" in text
+    assert "L1" in text
+    assert "根主题 / 子节点1" in text
+
+
+async def test_find_node_not_found(config: Config, sample_xmind: Path):
+    tools = XMindTools(config)
+    result = await tools.call_tool("find_node", {
+        "file_path": str(sample_xmind),
+        "keyword": "不存在",
+    })
+    assert "未找到" in result[0].text
 
 
 async def test_add_and_save(config: Config, sample_xmind: Path, tmp_path: Path):
@@ -94,6 +142,40 @@ async def test_add_and_save(config: Config, sample_xmind: Path, tmp_path: Path):
     # 重新读取验证
     read_result = await tools.call_tool("read_structure", {"file_path": str(out)})
     assert "工具新增节点" in read_result[0].text
+
+
+async def test_add_node_auto_save(config: Config, sample_xmind: Path):
+    tools = XMindTools(config)
+    result = await tools.call_tool("add_node", {
+        "file_path": str(sample_xmind),
+        "parent_id": "root-1",
+        "title": "自动保存节点",
+        "auto_save": True,
+    })
+    assert "已自动保存" in result[0].text
+
+    # 重新读取原文件验证
+    read_result = await tools.call_tool("read_structure", {"file_path": str(sample_xmind)})
+    assert "自动保存节点" in read_result[0].text
+
+
+async def test_export_markdown(config: Config, sample_xmind: Path):
+    tools = XMindTools(config)
+    result = await tools.call_tool("export_markdown", {
+        "file_path": str(sample_xmind),
+        "include_ids": True,
+    })
+    text = result[0].text
+    assert "# 测试工作表" in text
+    assert "- 根主题" in text
+    assert "- 子节点1" in text
+    assert "`id:root-1`" in text
+
+
+async def test_file_not_found(config: Config):
+    tools = XMindTools(config)
+    result = await tools.call_tool("read_structure", {"file_path": "不存在的文件.xmind"})
+    assert "文件不存在" in result[0].text
 
 
 async def test_get_hardware_info(config: Config):

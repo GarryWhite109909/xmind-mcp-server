@@ -58,6 +58,7 @@ class TopicNode:
     image_src: str = ""
     image_data: Optional[bytes] = None
     markers: list[str] = field(default_factory=list)
+    labels: list[str] = field(default_factory=list)
     parent_id: str = ""
     # 在 XMind 文件中的原始 topic dict（用于写回时定位）
     _raw: Optional[dict] = field(default=None, repr=False)
@@ -152,6 +153,16 @@ def _parse_markers(topic_dict: dict) -> list[str]:
     return []
 
 
+def _parse_labels(topic_dict: dict) -> list[str]:
+    """提取节点标签列表。"""
+    labels = topic_dict.get("labels", [])
+    if isinstance(labels, list):
+        return [str(label) for label in labels]
+    if isinstance(labels, str):
+        return [labels]
+    return []
+
+
 def _parse_image_src(topic_dict: dict) -> str:
     """提取图片引用路径。"""
     image = topic_dict.get("image")
@@ -169,6 +180,7 @@ def _parse_topic(topic_dict: dict, level: int = 0, parent_id: str = "") -> Topic
         notes=_parse_notes(topic_dict),
         image_src=_parse_image_src(topic_dict),
         markers=_parse_markers(topic_dict),
+        labels=_parse_labels(topic_dict),
         parent_id=parent_id,
         _raw=topic_dict,
     )
