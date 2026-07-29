@@ -76,3 +76,15 @@ class PaddleOCRBackend(OCRBackend):
             lines=lines,
             elapsed=elapsed,
         )
+
+    def close(self) -> None:
+        """释放 PaddleOCR / Paddle 占用的内存和显存。"""
+        if self._ocr is None:
+            return
+        try:
+            import gc
+            del self._ocr
+            self._ocr = None
+            gc.collect()
+        except Exception:
+            pass

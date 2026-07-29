@@ -130,6 +130,14 @@ class OCRManager:
         return cur.rowcount
 
     def close(self) -> None:
+        """关闭缓存数据库连接。"""
         if self._cache_conn:
             self._cache_conn.close()
             self._cache_conn = None
+
+    def unload(self) -> None:
+        """释放所有 OCR 资源：关闭缓存 + 卸载模型。"""
+        self.close()
+        if self._backend is not None:
+            self._backend.close()
+            self._backend = None

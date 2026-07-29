@@ -33,6 +33,11 @@ class OCRBackend(ABC):
         """识别图片中的文字。"""
         ...
 
+    @abstractmethod
+    def close(self) -> None:
+        """释放模型占用的内存/显存资源。"""
+        ...
+
     def recognize_text(self, image: ImageInput) -> str:
         """只返回纯文本，便捷方法。"""
         return self.recognize(image).text

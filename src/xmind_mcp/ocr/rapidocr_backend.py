@@ -72,3 +72,29 @@ class RapidOCRBackend(OCRBackend):
             lines=lines,
             elapsed=elapsed,
         )
+
+    def close(self) -> None:
+        """释放 RapidOCR / onnxruntime 占用的内存和显存。"""
+        if self._ocr is None:
+            return
+
+        # 尝试释放 onnxruntime 内部 session
+        try:
+            session = getattr(self._ocr, "session", None)
+            if session is not None:
+                # 某些版本有 __del__，显式释放输入输出名引用
+                session._inputs_meta = None
+                session._outputs_meta = None
+                del session
+        except Exception:
+            pass
+
+        del self._ocr
+        self._ocr = None
+
+        # 强制触发 Python 垃圾回收，尽快释放显存
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass

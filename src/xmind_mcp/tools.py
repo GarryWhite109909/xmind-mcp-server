@@ -313,6 +313,10 @@ class XMindTools:
         self.workspace = XMindWorkspace()
         self.ocr = OCRManager(config)
 
+    def close(self) -> None:
+        """释放 OCR 模型等资源。"""
+        self.ocr.unload()
+
     async def call_tool(self, name: str, arguments: dict) -> list[types.TextContent]:
         handler = self._handlers.get(name)
         if handler is None:

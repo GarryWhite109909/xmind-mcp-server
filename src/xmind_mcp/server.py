@@ -59,5 +59,9 @@ async def run_server(config: Config) -> None:
         ),
     )
 
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, init_options)
+    try:
+        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, init_options)
+    finally:
+        # MCP 客户端断开或进程退出时，释放 OCR 模型/显存
+        tools.close()
