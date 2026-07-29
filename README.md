@@ -4,7 +4,6 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![PyPI](https://img.shields.io/badge/pip-xmind--mcp--server-orange.svg)](https://pypi.org/project/xmind-mcp-server/)
 
 XMind MCP Server 是一个基于 [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) 的本地服务。它把 XMind 文件解析、图片 OCR、节点编辑和文件写回能力封装成一套标准工具，供 Trae、Claude Desktop、Cursor 等支持 MCP 的客户端调用。
 
@@ -74,16 +73,12 @@ XMind MCP Server 是一个基于 [Model Context Protocol (MCP)](https://modelcon
 
 ## 📦 安装
 
-### 从 PyPI 安装（推荐）
+> **PyPI 发布状态**：包名 `xmind-mcp-server` 目前尚未发布到 PyPI。当前只能通过源码或 Git 安装。未来发布到 PyPI 后，即可使用 `pip install xmind-mcp-server`。
+
+### 从 GitHub 安装（推荐）
 
 ```bash
-pip install xmind-mcp-server
-```
-
-带 RapidOCR 依赖：
-
-```bash
-pip install "xmind-mcp-server[rapidocr]"
+pip install "git+https://github.com/GarryWhite109909/xmind-mcp-server.git#egg=xmind-mcp-server[rapidocr]"
 ```
 
 ### 从源码安装
