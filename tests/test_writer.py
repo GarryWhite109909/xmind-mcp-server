@@ -211,6 +211,107 @@ def test_set_node_style_uses_xmind_fields_for_fill_and_border(sample_xmind: Path
     assert "fo:border-color" not in props
 
 
+def test_set_node_style_chinese_props(sample_xmind: Path):
+    """中文属性名/预设/百分比透明度都要正确映射成 XMind 字段。"""
+    xm = parse_xmind(sample_xmind)
+    writer = XMindWriter(xm)
+    ok = writer.set_node_style(
+        "child-1",
+        importance="极其重要",
+        shape="跑道",
+        border_width="粗",
+        border_pattern="虚线",
+        font_size=24,
+        font_weight="加粗",
+        font_transform="全大写",
+        font_decoration="下划线+删除线",
+        background_color="4E0D58 60%",
+        line_pattern="点线",
+        text_align="居中",
+    )
+    assert ok
+    raw = xm.find_topic("child-1")._raw
+    assert raw["class"] == "importantTopic"
+    props = raw["style"]["properties"]
+    assert props["shape-class"] == "org.xmind.topicShape.ellipserect"
+    assert props["border-line-width"] == "5pt"
+    assert props["border-line-pattern"] == "dash"
+    assert props["fo:font-size"] == "24pt"
+    assert props["fo:font-weight"] == "bold"
+    assert props["fo:text-transform"] == "uppercase"
+    assert props["fo:text-decoration"] == "underline line-through"
+    assert props["svg:fill"] == "#4E0D5899"
+    assert props["line-pattern"] == "dot"
+    assert props["fo:text-align"] == "center"
+
+
+def test_shape_names_match_xmind_ui(sample_xmind: Path):
+    """切角矩形/竖胶囊等形状名必须映射到用户用 XMind 实测确认的 ID。"""
+    xm = parse_xmind(sample_xmind)
+    writer = XMindWriter(xm)
+
+    writer.set_node_style("child-1", shape="切角矩形")
+    assert xm.find_topic("child-1").style["properties"]["shape-class"] == "org.xmind.topicShape.roundedhexagon"
+
+    writer.set_node_style("child-1", shape="竖胶囊")
+    assert xm.find_topic("child-1").style["properties"]["shape-class"] == "org.xmind.topicShape.ellipticrectangle"
+
+    writer.set_node_style("child-1", shape="跑道")
+    assert xm.find_topic("child-1").style["properties"]["shape-class"] == "org.xmind.topicShape.ellipserect"
+
+    writer.set_node_style("child-1", shape="切角菱形")
+    assert xm.find_topic("child-1").style["properties"]["shape-class"] == "org.xmind.topicShape.cutdiamond"
+
+
+def test_set_branch_style(sample_xmind: Path):
+    xm = parse_xmind(sample_xmind)
+    writer = XMindWriter(xm)
+    ok = writer.set_branch_style(
+        "child-1",
+        line_type="曲线",
+        arrow_end="双箭头",
+        line_width="极粗",
+        line_color="#FF6B6B",
+    )
+    assert ok
+    props = xm.find_topic("child-1").style["properties"]
+    assert props["line-class"] == "org.xmind.branchConnection.curve"
+    assert props["arrow-end-class"] == "org.xmind.arrowShape.doublearrow"
+    assert props["line-width"] == "8pt"
+    assert props["line-color"] == "#FF6B6B"
+
+
+def test_set_theme_style(sample_xmind: Path):
+    xm = parse_xmind(sample_xmind)
+    writer = XMindWriter(xm)
+    ok = writer.set_theme_style(
+        0,
+        level="分支主题",
+        shape="圆角矩形",
+        font_size=18,
+        background_color="4E0D58 50%",
+        font_weight="加粗",
+    )
+    assert ok
+    theme = xm.raw_content[0]["theme"]
+    props = theme["mainTopic"]["properties"]
+    assert props["shape-class"] == "org.xmind.topicShape.roundedRect"
+    assert props["fo:font-size"] == "18pt"
+    assert props["svg:fill"] == "#4E0D5880"
+    assert props["fo:font-weight"] == "bold"
+
+
+def test_set_sheet_layout_chinese(sample_xmind: Path):
+    xm = parse_xmind(sample_xmind)
+    writer = XMindWriter(xm)
+    assert writer.set_sheet_layout(0, "时间轴")
+    assert xm.sheets[0].root.structure_class == "org.xmind.ui.timeline.horizontal"
+    assert xm.raw_content[0]["rootTopic"]["structureClass"] == "org.xmind.ui.timeline.horizontal"
+
+    assert writer.set_sheet_layout(0, "括号图")
+    assert xm.raw_content[0]["rootTopic"]["structureClass"] == "org.xmind.ui.brace.right"
+
+
 def test_set_sheet_layout(sample_xmind: Path):
     xm = parse_xmind(sample_xmind)
     writer = XMindWriter(xm)

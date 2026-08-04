@@ -91,8 +91,8 @@ async def run_server(config: Config) -> None:
         params: types.CallToolRequestParams,
     ) -> types.CallToolResult:
         try:
-            messages = await tools.call_tool(params.name, params.arguments or {})
-            return types.CallToolResult(content=messages)
+            messages, is_error = await tools.call_tool_status(params.name, params.arguments or {})
+            return types.CallToolResult(content=messages, isError=is_error)
         except Exception as exc:
             return types.CallToolResult(
                 content=[

@@ -244,17 +244,3 @@ def detect_hardware() -> HardwareInfo:
 
 def has_nvidia_gpu(hw: HardwareInfo) -> bool:
     return any(g.vendor == "nvidia" for g in hw.gpus)
-
-
-def has_discrete_gpu(hw: HardwareInfo) -> bool:
-    """是否有独立显卡（NVIDIA 全算，AMD/Intel 看名字判断）。"""
-    for g in hw.gpus:
-        if g.vendor == "nvidia":
-            return True
-        if g.vendor in ("amd", "intel"):
-            name_lower = g.name.lower()
-            # 集成显卡关键词
-            integrated = ["integrated", "iris", "uhd graphics", "hd graphics", "radeon graphics"]
-            if not any(kw in name_lower for kw in integrated):
-                return True
-    return False

@@ -218,7 +218,9 @@ def _parse_topic(
     """递归解析一个 topic 字典为 TopicNode。"""
     node = TopicNode(
         id=topic_dict.get("id", ""),
-        title=topic_dict.get("title", ""),
+        # 兼容标题为 null 的畸形文件：统一归一化为空字符串，
+        # 避免 find_node / analyze_file / apply_matching 等下游直接 .lower()/.strip() 崩溃
+        title=topic_dict.get("title") or "",
         level=level,
         sheet_index=sheet_index,
         topic_class=topic_class,

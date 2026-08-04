@@ -194,8 +194,12 @@ xmind-mcp
 | `find_node`       | 按标题关键词搜索节点，返回 ID 和路径                                                             |
 | `get_node`        | 读取单个节点完整信息（含主题类型、节点自身样式、主题继承样式、超链接、父节点）                                          |
 | `analyze_file`    | 文件统计/体检：节点数、深度、重复标题、空节点等                                                         |
+| `analyze_style`   | 样式审计：主题层级默认样式、颜色/字体/形状使用统计、节点有效样式                                      |
 | `export_markdown` | 导出为 Markdown 大纲                                                                  |
 | `export_text`     | 导出为纯文本大纲                                                                         |
+| `export_svg`      | 导出节点树示意图 SVG（供人工预览）                                                            |
+| `list_sheets`     | 列出所有工作表                                                                          |
+| `list_attachments`| 列出附件/图片资源，标注被引用与未引用                                                          |
 
 ### 结构编辑类
 
@@ -211,16 +215,28 @@ xmind-mcp
 | `create_file`          | 从零新建 XMind 文件（支持嵌套 JSON 结构）                  |
 | `import_markdown`      | 把传入的 Markdown 文本逐行原样转成 XMind（不概括、不精简）        |
 | `import_markdown_file` | 直接读取磁盘上的 .md 文件，逐行原样转成 XMind（表格、代码块、引用都保留）   |
-| `repair_file`          | 修复打不开的 XMind 文件（自动补全必需组成部分，覆盖前自动备份）          |
-| `apply_to_matching`    | 按标题关键词批量设置样式、标记、标签                           |
+| `repair_file`          | 修复打不开的 XMind 文件（补全必需组成部分；content.json 缺失/损坏时重建空白画布并保留附件，覆盖前自动备份） |
+| `apply_to_matching`    | 按标题关键词批量设置样式、标记、标签（支持 preview 预览）          |
+| `batch_update_titles`  | 按关键词/正则批量替换标题                                   |
+| `delete_empty_nodes`   | 删除空标题节点（含子树）                                   |
+| `merge_duplicate_nodes`| 合并标题相同的兄弟节点（子节点并入后删除重复项）                    |
+| `notes_to_children`    | 备注逐行转为子节点                                       |
+| `children_to_notes`    | 子节点标题合并为备注                                      |
+| `auto_number`          | 自动编号（decimal / hierarchical）                     |
+| `add_sheet` / `rename_sheet` | 新增 / 重命名工作表                               |
+| `delete_sheet` / `move_sheet` | 删除 / 排序工作表                               |
+| `list_backups` / `restore_backup` | 列出 / 恢复自动备份（恢复前会再备份当前文件）           |
+| `remove_unused_attachments` | 移除未被引用的附件/图片，减小文件体积                     |
 
 ### 美化 / 标记类（让笔记更美观易读）
 
 | 工具                                         | 说明                                          |
 | ------------------------------------------ | ------------------------------------------- |
-| `set_node_style`                           | 设置字体、字号、颜色、加粗、斜体、背景色、边框色/宽度、节点形状、连线颜色/宽度、对齐 |
-| `set_sheet_layout`                         | 切换工作表布局（思维导图/逻辑图/树形图/组织结构图等）                |
-| `apply_style_preset`                       | 一键套用配色预设（清新蓝 / 暖阳橙 / 莫兰迪绿）                  |
+| `set_node_style`                           | 字体、字号、颜色、加粗/斜体、删除线/下划线、大小写变换、背景/边框色、线宽预设（极细~极粗）、填充/边框线型、形状（12种）、重要程度（极其重要/重要/删去/默认）、对齐；颜色支持 #RRGGBBAA 和「4E0D58 60%」透明度写法 |
+| `set_branch_style`                         | 分支连线类型（圆角折线/折线/直线/曲线/圆弧/手绘/圆角手绘）、终点样式（圆点/三角形/菱形/双箭头等）、粗细、颜色、线型 |
+| `set_theme_style`                          | 主题级默认样式：中心主题/分支主题/第三层级主题/细分主题/自由主题 |
+| `set_sheet_layout`                         | 切换工作表布局（思维导图/逻辑图/括号图/组织结构图/树形图/时间轴/鱼骨图/矩阵图/树型表格） |
+| `apply_style_preset`                       | 一键套用配色预设（清新蓝 / 暖阳橙 / 莫兰迪绿，支持 preview 预览）   |
 | `set_hyperlink`                            | 给节点添加 / 移除超链接                               |
 | `add_image`                                | 给节点插入本地图片                                   |
 | `add_summary`                              | 给连续子节点区间添加概要                                |

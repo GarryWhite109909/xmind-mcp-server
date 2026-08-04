@@ -25,6 +25,25 @@ from typing import Optional, Union
 from . import __version__
 from .config import BACKUP_DIR
 from .xmind_parser import XMindFile, TopicNode, parse_xmind, topic_ids_in_subtree
+from .xmind_props import (
+    ARROW_ENDS,
+    BORDER_PATTERNS,
+    BRANCH_LINES,
+    FILL_PATTERNS,
+    FONT_STYLES,
+    FONT_WEIGHTS,
+    IMPORTANCE,
+    SHAPES,
+    STRUCTURES,
+    TEXT_ALIGNS,
+    TEXT_TRANSFORMS,
+    THEME_LEVELS,
+    normalize_color,
+    resolve,
+    resolve_font_size,
+    resolve_text_decoration,
+    resolve_width,
+)
 
 
 STYLE_PRESETS: dict[str, dict[str, dict[str, str]]] = {
@@ -44,6 +63,47 @@ STYLE_PRESETS: dict[str, dict[str, dict[str, str]]] = {
         "leaf": {"background_color": "#F5FAF7", "font_color": "#333333"},
     },
 }
+
+
+_STYLE_MAPPING: dict[str, tuple[str, object]] = {
+    "font_color": ("fo:color", normalize_color),
+    "font_size": ("fo:font-size", resolve_font_size),
+    "font_family": ("fo:font-family", None),
+    "font_weight": ("fo:font-weight", lambda v: resolve(FONT_WEIGHTS, v, label="字重")),
+    "font_style": ("fo:font-style", lambda v: resolve(FONT_STYLES, v, label="字体样式")),
+    "font_transform": ("fo:text-transform", lambda v: resolve(TEXT_TRANSFORMS, v, label="文字变换")),
+    "font_decoration": ("fo:text-decoration", resolve_text_decoration),
+    "background_color": ("svg:fill", normalize_color),
+    "border_color": ("border-line-color", normalize_color),
+    "border_width": ("border-line-width", lambda v: resolve_width(v, label="边框宽度")),
+    "border_pattern": ("border-line-pattern", lambda v: resolve(BORDER_PATTERNS, v, label="边框线型")),
+    "shape": ("shape-class", lambda v: resolve(SHAPES, v, label="形状")),
+    "line_color": ("line-color", normalize_color),
+    "line_width": ("line-width", lambda v: resolve_width(v, label="线宽")),
+    "line_pattern": ("line-pattern", lambda v: resolve(BORDER_PATTERNS, v, label="线条线型")),
+    "text_align": ("fo:text-align", lambda v: resolve(TEXT_ALIGNS, v, label="对齐")),
+    "fill_pattern": ("fill-pattern", lambda v: resolve(FILL_PATTERNS, v, label="填充样式")),
+}
+
+
+def _prepare_style_updates(style: dict) -> dict:
+    """把用户可读的样式参数全部校验并解析成 XMind 属性 dict。
+
+    支持中文名称（形状/线宽/对齐等）、#RRGGBB、#RRGGBBAA、百分比透明度颜色。
+    先完整校验再返回结果，调用方拿到后一次性写入，
+    保证“参数非法时不做任何部分修改”（原子性）。
+    """
+    updates: dict[str, str] = {}
+    for kw, (fo_key, normalizer) in _STYLE_MAPPING.items():
+        value = style.get(kw)
+        if value is None:
+            continue
+        if normalizer is not None:
+            value = normalizer(value)
+        if value is not None:
+            updates[fo_key] = value
+    return updates
+
 
 # XMind 打开文件时的必需元数据。缺失 metadata.json 时 XMind 会直接报错拒绝打开。
 DEFAULT_METADATA: dict = {
@@ -131,6 +191,11 @@ def _backup_file(path: str) -> Optional[str]:
         stem = Path(path).stem
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         dest = BACKUP_DIR / f"{stem}-{timestamp}.xmind"
+        # 同一秒内多次备份时避免文件名冲突（否则会互相覆盖）
+        counter = 1
+        while dest.exists():
+            dest = BACKUP_DIR / f"{stem}-{timestamp}-{counter}.xmind"
+            counter += 1
         shutil.copyfile(path, dest)
 
         # 只保留最近 20 份同名备份
@@ -145,6 +210,39 @@ def _backup_file(path: str) -> Optional[str]:
     except Exception:
         # 备份失败不能阻断保存；失败时静默降级（用户仍能正常保存）。
         return None
+
+
+def list_backups(file_path: str) -> list[dict]:
+    """列出某个 xmind 文件已有的自动备份（新到旧）。"""
+    stem = Path(file_path).stem
+    backups: list[dict] = []
+    if not BACKUP_DIR.is_dir():
+        return backups
+    for p in sorted(
+        BACKUP_DIR.glob(f"{stem}-*.xmind"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ):
+        st = p.stat()
+        backups.append({
+            "path": str(p),
+            "name": p.name,
+            "size": st.st_size,
+            "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
+        })
+    return backups
+
+
+def restore_backup(file_path: str, backup_path: str) -> str:
+    """把指定备份恢复到目标文件（覆盖前先把当前文件也备份一份，保证可逆）。"""
+    backup = Path(backup_path)
+    if not backup.exists():
+        raise FileNotFoundError(f"备份文件不存在: {backup_path}")
+    target = Path(file_path)
+    if target.exists():
+        _backup_file(str(target))
+    shutil.copyfile(backup, target)
+    return str(target)
 
 
 def _find_topic_and_parent(
@@ -203,6 +301,19 @@ def _set_notes(topic_dict: dict, notes: str) -> None:
     topic_dict["notes"] = {"plain": {"content": notes}}
 
 
+def _raw_notes_text(topic_dict: dict) -> str:
+    """从 raw topic dict 里取备注纯文本（兼容新版 text 与旧版 plain.content）。"""
+    notes = topic_dict.get("notes")
+    if not isinstance(notes, dict):
+        return str(notes) if notes else ""
+    if isinstance(notes.get("text"), str):
+        return notes["text"]
+    plain = notes.get("plain")
+    if isinstance(plain, dict) and isinstance(plain.get("content"), str):
+        return plain["content"]
+    return ""
+
+
 def _parse_range_indices(range_value: object) -> Optional[tuple[int, int]]:
     """解析 XMind 的 range 字段："(0,1)" 或带 startId/endId 的 dict。
 
@@ -216,16 +327,28 @@ def _parse_range_indices(range_value: object) -> Optional[tuple[int, int]]:
     return None
 
 
+def _remove_summary_topic(topic: dict, summary_topic_id: str) -> None:
+    """从父节点的 children.summary 中移除概要主题节点。"""
+    children = topic.get("children", {})
+    if isinstance(children, dict):
+        summary_list = children.get("summary", [])
+        children["summary"] = [
+            c for c in summary_list
+            if isinstance(c, dict) and c.get("id") != summary_topic_id
+        ]
+        if not children["summary"]:
+            children.pop("summary", None)
+
+
 def _cleanup_dangling_refs(
     raw_content: list[dict],
     removed_ids: set[str],
-    removed_parent: Optional[dict] = None,
-    removed_index: Optional[int] = None,
 ) -> None:
     """删除节点后，清理引用被删 ID 的 relationships / summaries / boundaries。
 
     XMind 里这些引用如果悬空，轻则打开报错，重则导致文件打不开，
-    所以删除子树时要一并清掉。
+    所以删除子树时要一并清掉。字符串索引区间（"(i,j)"）由
+    _remap_visual_ranges 在调用方处理，这里只处理 dict 区间和 ID 引用。
     """
     if not removed_ids:
         return
@@ -257,33 +380,10 @@ def _cleanup_dangling_refs(
                             _remove_summary_topic(topic, summary_topic_id)
                             removed_ids.add(summary_topic_id)
                         continue
-                    # 字符串索引区间：删除的子节点如果落在区间内，条目失效
-                    if (
-                        topic is removed_parent
-                        and removed_index is not None
-                        and (rng := _parse_range_indices(item.get("range"))) is not None
-                        and rng[0] <= removed_index <= rng[1]
-                    ):
-                        summary_topic_id = item.get("topicId")
-                        if summary_topic_id and summary_topic_id not in removed_ids:
-                            _remove_summary_topic(topic, summary_topic_id)
-                            removed_ids.add(summary_topic_id)
-                        continue
                     keep.append(item)
                 topic[key] = keep
                 if not topic[key]:
                     topic.pop(key, None)
-
-    def _remove_summary_topic(topic: dict, summary_topic_id: str) -> None:
-        children = topic.get("children", {})
-        if isinstance(children, dict):
-            summary_list = children.get("summary", [])
-            children["summary"] = [
-                c for c in summary_list
-                if isinstance(c, dict) and c.get("id") != summary_topic_id
-            ]
-            if not children["summary"]:
-                children.pop("summary", None)
 
     for sheet in raw_content:
         if not isinstance(sheet, dict):
@@ -316,6 +416,60 @@ def _cleanup_dangling_refs(
             _walk(root)
 
 
+def _attached_ids(parent_dict: dict) -> list[str]:
+    """返回父节点 attached 子节点的 ID 列表。"""
+    attached = parent_dict.get("children", {}).get("attached", [])
+    return [
+        child.get("id")
+        for child in attached
+        if isinstance(child, dict) and child.get("id")
+    ]
+
+
+def _remap_visual_ranges(parent_dict: dict, old_attached_ids: list[str]) -> None:
+    """结构变更后，按“原区间覆盖的节点 ID”重算 summary/boundary 的字符串索引区间。
+
+    XMind 的 summary/boundary 用字符串索引 "(i,j)" 指向父节点 attached 子列表。
+    删除/插入/移动兄弟节点后索引会整体漂移，如果不重算，视觉元素会悄悄
+    绑到错误的节点上。这里先把旧区间翻译成节点 ID，再映射回新索引；
+    区间内任一节点已不存在（被删除/移走）则整个条目失效并清除。
+    """
+    new_ids = _attached_ids(parent_dict)
+    new_index = {tid: i for i, tid in enumerate(new_ids)}
+
+    for key, topic_key in (("summaries", "topicId"), ("boundaries", None)):
+        items = parent_dict.get(key)
+        if not isinstance(items, list):
+            continue
+        keep: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                keep.append(item)
+                continue
+            rng = _parse_range_indices(item.get("range"))
+            if rng is None:
+                # dict 区间由 _cleanup_dangling_refs 按 ID 处理，这里原样保留
+                keep.append(item)
+                continue
+            start, end = rng
+            if start < 0 or end >= len(old_attached_ids):
+                keep.append(item)
+                continue
+            covered = old_attached_ids[start : end + 1]
+            covered = [tid for tid in covered if tid]
+            if not covered or not all(tid in new_index for tid in covered):
+                if key == "summaries" and topic_key:
+                    summary_topic_id = item.get(topic_key)
+                    if summary_topic_id:
+                        _remove_summary_topic(parent_dict, summary_topic_id)
+                continue
+            item["range"] = f"({new_index[covered[0]]},{new_index[covered[-1]]})"
+            keep.append(item)
+        parent_dict[key] = keep
+        if not keep:
+            parent_dict.pop(key, None)
+
+
 def _ensure_children_attached(topic: dict) -> list:
     """确保 topic 有 children.attached 列表，返回该列表。"""
     if "children" not in topic or not isinstance(topic["children"], dict):
@@ -346,6 +500,41 @@ class XMindWriter:
         self.xm = xm
         # 新增的 zip 资源（如插入的图片），保存时写入
         self._extra_files: dict[str, bytes] = {}
+        # 保存时要排除的 zip 条目（如删除的未引用附件）
+        self._exclude_files: set[str] = set()
+
+    @staticmethod
+    def _new_sheet(
+        title: str,
+        root_title: str,
+        children: Optional[list[dict]] = None,
+    ) -> dict:
+        """构造一张新工作表的完整 dict（含默认主题/扩展/revisionId）。"""
+        root_id = str(uuid.uuid4())
+        root = {
+            "id": root_id,
+            "title": root_title,
+            "class": "topic",
+            "titleUnedited": True,
+            "structureClass": "org.xmind.ui.map.clockwise",
+            "children": {"attached": children or [], "detached": []},
+        }
+        return {
+            "id": str(uuid.uuid4()),
+            "revisionId": str(uuid.uuid4()),
+            "class": "sheet",
+            "title": title,
+            "rootTopic": root,
+            "relationships": [],
+            "topicOverlapping": "overlap",
+            "arrangeableLayerOrder": [root_id],
+            "zones": [],
+            "extensions": [{
+                "provider": "org.xmind.ui.skeleton.structure.style",
+                "content": {"centralTopic": "org.xmind.ui.map.clockwise"},
+            }],
+            "theme": _new_theme(),
+        }
 
     def add_node(
         self,
@@ -378,7 +567,10 @@ class XMindWriter:
             new_topic["markers"] = {"markerId": markers}
 
         attached_list = _ensure_children_attached(parent_dict)
+        old_ids = _attached_ids(parent_dict)
         self._insert_topic(attached_list, new_topic, before_id, after_id)
+        # 插入会改变兄弟索引，重算概要/边界区间，避免视觉元素错位
+        _remap_visual_ranges(parent_dict, old_ids)
 
         self.xm.refresh_from_raw()
         new_node = self.xm.find_topic(new_id)
@@ -417,18 +609,10 @@ class XMindWriter:
             raise ValueError("不能删除根主题")
 
         removed_ids = topic_ids_in_subtree(topic_dict)
-        attached = parent_dict.get("children", {}).get("attached", [])
-        removed_index = next(
-            (i for i, c in enumerate(attached) if isinstance(c, dict) and c.get("id") == node_id),
-            None,
-        )
+        old_ids = _attached_ids(parent_dict)
         _remove_topic_from_parent(parent_dict, node_id)
-        _cleanup_dangling_refs(
-            self.xm.raw_content,
-            removed_ids,
-            removed_parent=parent_dict,
-            removed_index=removed_index,
-        )
+        _cleanup_dangling_refs(self.xm.raw_content, removed_ids)
+        _remap_visual_ranges(parent_dict, old_ids)
         self.xm.refresh_from_raw()
         return True
 
@@ -470,12 +654,36 @@ class XMindWriter:
         if new_parent_id == node_id or _is_descendant(topic_dict, new_parent_id):
             raise ValueError("不能把节点移动到自己或自己的后代下")
 
+        # 先校验插入位置（必须是目标父节点的直属子节点），
+        # 任何错误都不能先动树，否则节点会从旧位置消失（数据丢失）。
+        siblings = [
+            child.get("id")
+            for child in new_parent_dict.get("children", {}).get("attached", [])
+            if isinstance(child, dict)
+        ]
+        for ref_id, label in ((before_id, "before_id"), (after_id, "after_id")):
+            if ref_id is not None and ref_id not in siblings:
+                raise ValueError(
+                    f"找不到 {label} 指定的节点: {ref_id}（必须是目标父节点的直属子节点）"
+                )
+
+        same_parent = old_parent_dict is new_parent_dict
+        old_ids = _attached_ids(old_parent_dict)
+        new_ids = _attached_ids(new_parent_dict)
+
         # 从旧父节点移除
         _remove_topic_from_parent(old_parent_dict, node_id)
 
         # 加到新父节点的 attached（支持指定位置）
         new_attached = _ensure_children_attached(new_parent_dict)
         self._insert_topic(new_attached, topic_dict, before_id, after_id)
+
+        # 移动会让旧父/新父的兄弟索引都漂移，分别重算概要/边界区间
+        if same_parent:
+            _remap_visual_ranges(new_parent_dict, old_ids)
+        else:
+            _remap_visual_ranges(old_parent_dict, old_ids)
+            _remap_visual_ranges(new_parent_dict, new_ids)
 
         self.xm.refresh_from_raw()
         return True
@@ -489,6 +697,7 @@ class XMindWriter:
             raise ValueError("不能给概要(summary)或批注(callout)节点添加子节点")
 
         attached_list = _ensure_children_attached(parent_dict)
+        old_ids = _attached_ids(parent_dict)
         new_ids = []
         for title in titles:
             new_id = str(uuid.uuid4())
@@ -500,6 +709,7 @@ class XMindWriter:
             })
             new_ids.append(new_id)
 
+        _remap_visual_ranges(parent_dict, old_ids)
         self.xm.refresh_from_raw()
         nodes = [n for n in self.xm.all_topics() if n.id in new_ids]
         return nodes
@@ -534,7 +744,6 @@ class XMindWriter:
 
         # 深拷贝并重新生成所有子节点 ID
         def _rewrite_ids(topic: dict) -> dict:
-            import copy
             new_topic = copy.deepcopy(topic)
             new_topic["id"] = str(uuid.uuid4())
             children = new_topic.get("children", {})
@@ -556,69 +765,178 @@ class XMindWriter:
         self,
         node_id: str,
         *,
-        font_color: Optional[str] = None,
-        font_size: Optional[str] = None,
-        font_family: Optional[str] = None,
-        font_weight: Optional[str] = None,
-        font_style: Optional[str] = None,
-        background_color: Optional[str] = None,
-        border_color: Optional[str] = None,
-        border_width: Optional[str] = None,
-        shape: Optional[str] = None,
-        line_color: Optional[str] = None,
-        line_width: Optional[str] = None,
-        text_align: Optional[str] = None,
+        importance: Optional[str] = None,
+        **style: object,
     ) -> bool:
-        """设置节点样式（字体/颜色等）。值传 None 表示不修改该项。"""
+        """设置节点样式（字体/颜色/形状/填充/边框等）。值传 None 表示不修改该项。
+
+        importance 设置主题重要程度（极其重要/重要/删去/默认），
+        其余参数与 set_node_style 一致（支持中文名、#RRGGBB、#RRGGBBAA、百分比透明度）。
+        """
         topic_dict, _, _ = _find_topic_and_parent(self.xm.raw_content, node_id)
         if topic_dict is None:
             return False
 
-        style = topic_dict.get("style")
-        if not isinstance(style, dict):
-            style = {}
-            topic_dict["style"] = style
-        props = style.get("properties")
-        if not isinstance(props, dict):
-            props = {}
-            style["properties"] = props
-
-        mapping = {
-            "font_color": "fo:color",
-            "font_size": "fo:font-size",
-            "font_family": "fo:font-family",
-            "font_weight": "fo:font-weight",
-            "font_style": "fo:font-style",
-            # XMind 主题的填充/边框字段是 svg:fill / border-line-color，
-            # fo:background-color / fo:border-color 不会被 XMind 识别为主题样式。
-            "background_color": "svg:fill",
-            "border_color": "border-line-color",
-            "border_width": "border-line-width",
-            "shape": "shape-class",
-            "line_color": "line-color",
-            "line_width": "line-width",
-            "text_align": "fo:text-align",
-        }
-        for kw, fo_key in mapping.items():
-            value = locals().get(kw)
-            if value is not None:
-                props[fo_key] = value
+        # 先完整校验所有参数，再一次性写入，避免参数非法时产生部分修改
+        new_class = (
+            resolve(IMPORTANCE, importance, label="重要程度")
+            if importance is not None
+            else None
+        )
+        updates = _prepare_style_updates(style)
+        if new_class is not None:
+            topic_dict["class"] = new_class
+        if updates:
+            topic_style = topic_dict.get("style")
+            if not isinstance(topic_style, dict):
+                topic_style = {}
+                topic_dict["style"] = topic_style
+            props = topic_style.get("properties")
+            if not isinstance(props, dict):
+                props = {}
+                topic_style["properties"] = props
+            props.update(updates)
 
         self.xm.refresh_from_raw()
         return True
 
+    @staticmethod
+    def _set_topic_style_dict(topic_dict: dict, updates: dict) -> None:
+        """把已解析好的样式属性直接写入 topic dict（批量操作内部使用）。"""
+        if not updates:
+            return
+        topic_style = topic_dict.get("style")
+        if not isinstance(topic_style, dict):
+            topic_style = {}
+            topic_dict["style"] = topic_style
+        props = topic_style.get("properties")
+        if not isinstance(props, dict):
+            props = {}
+            topic_style["properties"] = props
+        props.update(updates)
+
     def set_sheet_layout(
         self,
         sheet_index: int = 0,
-        layout: str = "org.xmind.ui.map.clockwise",
+        layout: str = "思维导图",
     ) -> bool:
-        """切换工作表根主题的布局结构（structureClass）。"""
+        """切换工作表根主题的布局结构（structureClass），支持中文名（逻辑图/括号图/时间轴等）。"""
         if sheet_index < 0 or sheet_index >= len(self.xm.raw_content):
             return False
         root = self.xm.raw_content[sheet_index].get("rootTopic", {})
         if not root:
             return False
-        root["structureClass"] = layout
+        root["structureClass"] = resolve(STRUCTURES, layout, label="布局结构")
+        self.xm.refresh_from_raw()
+        return True
+
+    def add_sheet(self, title: str = "画布", root_title: str = "中心主题") -> int:
+        """新增一张工作表，返回其索引。"""
+        self.xm.raw_content.append(self._new_sheet(title, root_title))
+        self.xm.refresh_from_raw()
+        return len(self.xm.raw_content) - 1
+
+    def rename_sheet(self, sheet_index: int, title: str) -> bool:
+        """重命名工作表。"""
+        if sheet_index < 0 or sheet_index >= len(self.xm.raw_content):
+            return False
+        self.xm.raw_content[sheet_index]["title"] = title
+        self.xm.refresh_from_raw()
+        return True
+
+    def delete_sheet(self, sheet_index: int) -> bool:
+        """删除工作表（至少保留一张）。"""
+        if sheet_index < 0 or sheet_index >= len(self.xm.raw_content):
+            return False
+        if len(self.xm.raw_content) <= 1:
+            return False
+        del self.xm.raw_content[sheet_index]
+        self.xm.refresh_from_raw()
+        return True
+
+    def move_sheet(self, sheet_index: int, new_index: int) -> bool:
+        """移动工作表顺序（new_index 为最终位置）。"""
+        count = len(self.xm.raw_content)
+        if sheet_index < 0 or sheet_index >= count or new_index < 0 or new_index >= count:
+            return False
+        sheet = self.xm.raw_content.pop(sheet_index)
+        self.xm.raw_content.insert(new_index, sheet)
+        self.xm.refresh_from_raw()
+        return True
+
+    def set_branch_style(
+        self,
+        node_id: str,
+        *,
+        line_type: Optional[str] = None,
+        arrow_end: Optional[str] = None,
+        line_color: Optional[str] = None,
+        line_width: Optional[str] = None,
+        line_pattern: Optional[str] = None,
+    ) -> bool:
+        """设置某个节点的分支连线样式（line-class / arrow-end-class 等）。"""
+        topic_dict, _, _ = _find_topic_and_parent(self.xm.raw_content, node_id)
+        if topic_dict is None:
+            return False
+
+        # 先校验全部参数再写入，保证原子性
+        updates: dict[str, str] = {}
+        if line_type is not None:
+            updates["line-class"] = resolve(BRANCH_LINES, line_type, label="分支类型")
+        if arrow_end is not None:
+            updates["arrow-end-class"] = resolve(ARROW_ENDS, arrow_end, label="终点样式")
+        if line_color is not None:
+            updates["line-color"] = normalize_color(line_color)
+        if line_width is not None:
+            updates["line-width"] = resolve_width(line_width, label="线宽")
+        if line_pattern is not None:
+            updates["line-pattern"] = resolve(BORDER_PATTERNS, line_pattern, label="线条线型")
+        if updates:
+            style = topic_dict.get("style")
+            if not isinstance(style, dict):
+                style = {}
+                topic_dict["style"] = style
+            props = style.get("properties")
+            if not isinstance(props, dict):
+                props = {}
+                style["properties"] = props
+            props.update(updates)
+
+        self.xm.refresh_from_raw()
+        return True
+
+    def set_theme_style(
+        self,
+        sheet_index: int = 0,
+        level: str = "分支主题",
+        **style: object,
+    ) -> bool:
+        """设置主题级样式：中心主题/分支主题/第三层级主题/细分主题/自由主题的默认样式。
+
+        与 set_node_style 的参数一致（不含 importance）。影响整个层级的所有节点。
+        """
+        if sheet_index < 0 or sheet_index >= len(self.xm.raw_content):
+            return False
+        # 先校验参数与主题层级，任何错误都不产生结构/样式修改
+        key = resolve(THEME_LEVELS, level, label="主题层级")
+        updates = _prepare_style_updates(style)
+
+        sheet = self.xm.raw_content[sheet_index]
+        theme = sheet.get("theme")
+        if not isinstance(theme, dict):
+            theme = _new_theme()
+            sheet["theme"] = theme
+
+        entry = theme.get(key)
+        if not isinstance(entry, dict):
+            entry = {"id": str(uuid.uuid4())}
+            theme[key] = entry
+        props = entry.get("properties")
+        if not isinstance(props, dict):
+            props = {}
+            entry["properties"] = props
+
+        props.update(updates)
         self.xm.refresh_from_raw()
         return True
 
@@ -657,7 +975,10 @@ class XMindWriter:
             "id": summary_id,
             "title": title,
         }
-        children = parent_dict.setdefault("children", {})
+        children = parent_dict.get("children")
+        if not isinstance(children, dict):
+            children = {}
+            parent_dict["children"] = children
         summary_list = children.setdefault("summary", [])
         summary_list.append(summary_topic)
 
@@ -780,15 +1101,30 @@ class XMindWriter:
             raise ValueError(f"未知样式预设: {preset}，可选: {', '.join(STYLE_PRESETS)}")
         colors = STYLE_PRESETS[preset]
         count = 0
-        for node in self.xm.all_topics():
-            if node.level == 0:
-                style = colors["root"]
-            elif node.level == 1:
-                style = colors["branch"]
-            else:
-                style = colors["leaf"]
-            self.set_node_style(node.id, **style)
-            count += 1
+        for sheet in self.xm.raw_content:
+            root = sheet.get("rootTopic") if isinstance(sheet, dict) else None
+            if isinstance(root, dict):
+                count += self._apply_preset_to_tree(root, colors, 0)
+        # 只刷新一次解析树，避免每节点全树查找 + 全量刷新（O(n²)）
+        self.xm.refresh_from_raw()
+        return count
+
+    def _apply_preset_to_tree(self, topic: dict, colors: dict, level: int) -> int:
+        """递归按层级套用预设（直接改 raw dict，避免每节点全树查找）。"""
+        if level == 0:
+            style = colors["root"]
+        elif level == 1:
+            style = colors["branch"]
+        else:
+            style = colors["leaf"]
+        self._set_topic_style_dict(topic, _prepare_style_updates(style))
+        count = 1
+        children = topic.get("children", {})
+        if isinstance(children, dict):
+            for key in ("attached", "detached", "summary", "callout"):
+                for child in children.get(key, []):
+                    if isinstance(child, dict):
+                        count += self._apply_preset_to_tree(child, colors, level + 1)
         return count
 
     def add_image(self, node_id: str, image_path: Union[str, Path]) -> tuple[bool, str]:
@@ -838,6 +1174,13 @@ class XMindWriter:
         if topic_dict is None:
             return False
 
+        self._add_marker_to_topic(topic_dict, marker_id)
+        self.xm.refresh_from_raw()
+        return True
+
+    @staticmethod
+    def _add_marker_to_topic(topic_dict: dict, marker_id: str) -> None:
+        """直接给 topic dict 加标记（批量操作内部使用，不刷新解析树）。"""
         markers = topic_dict.get("markers")
         if not isinstance(markers, dict):
             markers = {"markerId": []}
@@ -849,23 +1192,24 @@ class XMindWriter:
         if marker_id not in marker_list:
             marker_list.append(marker_id)
 
-        self.xm.refresh_from_raw()
-        return True
-
     def remove_marker(self, node_id: str, marker_id: str) -> bool:
         """移除节点的指定标记图标。"""
         topic_dict, _, _ = _find_topic_and_parent(self.xm.raw_content, node_id)
         if topic_dict is None:
             return False
 
+        self._remove_marker_from_topic(topic_dict, marker_id)
+        self.xm.refresh_from_raw()
+        return True
+
+    @staticmethod
+    def _remove_marker_from_topic(topic_dict: dict, marker_id: str) -> None:
+        """直接移除 topic dict 上的标记（批量操作内部使用，不刷新解析树）。"""
         markers = topic_dict.get("markers")
         if isinstance(markers, dict) and isinstance(markers.get("markerId"), list):
             markers["markerId"] = [m for m in markers["markerId"] if m != marker_id]
             if not markers["markerId"]:
                 topic_dict.pop("markers", None)
-
-        self.xm.refresh_from_raw()
-        return True
 
     def add_label(self, node_id: str, label: str) -> bool:
         """给节点添加一个标签。"""
@@ -873,6 +1217,13 @@ class XMindWriter:
         if topic_dict is None:
             return False
 
+        self._add_label_to_topic(topic_dict, label)
+        self.xm.refresh_from_raw()
+        return True
+
+    @staticmethod
+    def _add_label_to_topic(topic_dict: dict, label: str) -> None:
+        """直接给 topic dict 加标签（批量操作内部使用，不刷新解析树）。"""
         labels = topic_dict.get("labels")
         if not isinstance(labels, list):
             labels = []
@@ -880,23 +1231,24 @@ class XMindWriter:
         if label not in labels:
             labels.append(label)
 
-        self.xm.refresh_from_raw()
-        return True
-
     def remove_label(self, node_id: str, label: str) -> bool:
         """移除节点的一个标签。"""
         topic_dict, _, _ = _find_topic_and_parent(self.xm.raw_content, node_id)
         if topic_dict is None:
             return False
 
+        self._remove_label_from_topic(topic_dict, label)
+        self.xm.refresh_from_raw()
+        return True
+
+    @staticmethod
+    def _remove_label_from_topic(topic_dict: dict, label: str) -> None:
+        """直接移除 topic dict 上的标签（批量操作内部使用，不刷新解析树）。"""
         labels = topic_dict.get("labels")
         if isinstance(labels, list):
             topic_dict["labels"] = [l for l in labels if l != label]
             if not topic_dict["labels"]:
                 topic_dict.pop("labels", None)
-
-        self.xm.refresh_from_raw()
-        return True
 
     def save(self, output_path: Optional[Union[str, Path]] = None) -> str:
         """保存文件。output_path 为 None 时覆盖原文件。
@@ -921,54 +1273,70 @@ class XMindWriter:
         # 序列化修改后的 content.json
         new_content = json.dumps(self.xm.raw_content, ensure_ascii=False, indent=2)
 
-        # 读取原始 zip，复制所有文件，替换 content.json，并补全必需文件
-        source_zip = io.BytesIO(self.xm._zip_bytes)
-        with zipfile.ZipFile(source_zip, "r") as zin:
-            with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zout:
-                written: set[str] = set()
-                manifest: dict = {}
-                for item in zin.infolist():
-                    if item.filename == "content.json":
-                        zout.writestr("content.json", new_content)
-                        written.add("content.json")
-                    elif item.filename == "manifest.json":
-                        try:
-                            manifest = json.loads(zin.read(item.filename))
-                        except (json.JSONDecodeError, KeyError):
-                            manifest = {}
-                    else:
-                        zout.writestr(item, zin.read(item.filename))
-                        written.add(item.filename)
+        # 读取原始 zip，复制所有文件，替换 content.json，并补全必需文件。
+        # 原始内容不是合法 zip（repair 重建场景）时按空白文件处理。
+        source_zip = io.BytesIO(self.xm._zip_bytes or b"")
+        try:
+            zin = zipfile.ZipFile(source_zip, "r")
+        except zipfile.BadZipFile:
+            zin = None
 
-                # 补全 XMind 必需文件（已存在的原样保留，例如 XMind 自己写的 content.xml）
-                required = (
-                    (
-                        "metadata.json",
-                        json.dumps(DEFAULT_METADATA, ensure_ascii=False, indent=2),
-                    ),
-                    ("cache.json", "{}"),
-                    ("content.xml", _content_xml_stub(self.xm.raw_content)),
-                )
-                for name, data in required:
-                    if name not in written:
-                        zout.writestr(name, data)
-                        written.add(name)
+        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            written: set[str] = set()
+            manifest: dict = {}
+            if zin is not None:
+                with zin:
+                    for item in zin.infolist():
+                        if item.filename in self._exclude_files:
+                            # 用户主动移除的附件/资源，不再写入
+                            continue
+                        if item.filename == "content.json":
+                            zout.writestr("content.json", new_content)
+                            written.add("content.json")
+                        elif item.filename == "manifest.json":
+                            try:
+                                manifest = json.loads(zin.read(item.filename))
+                            except (json.JSONDecodeError, KeyError):
+                                manifest = {}
+                        else:
+                            zout.writestr(item, zin.read(item.filename))
+                            written.add(item.filename)
 
-                # 新增资源（如插入的图片）
-                for name, data in self._extra_files.items():
-                    if name not in written:
-                        zout.writestr(name, data)
-                        written.add(name)
+            # 补全 XMind 必需文件（已存在的原样保留，例如 XMind 自己写的 content.xml）
+            required = (
+                (
+                    "metadata.json",
+                    json.dumps(DEFAULT_METADATA, ensure_ascii=False, indent=2),
+                ),
+                ("cache.json", "{}"),
+                ("content.xml", _content_xml_stub(self.xm.raw_content)),
+            )
+            for name, data in required:
+                if name not in written:
+                    zout.writestr(name, data)
+                    written.add(name)
 
-                # manifest 登记所有文件（目录项不登记）
-                entries = manifest.setdefault("file-entries", {})
-                for name in written:
-                    if name != "manifest.json" and not name.endswith("/"):
-                        entries.setdefault(name, {})
-                zout.writestr(
-                    "manifest.json",
-                    json.dumps(manifest, ensure_ascii=False, indent=2),
-                )
+            # 原 zip 缺 content.json 时补上（repair 重建场景），
+            # 保证保存结果始终是能打开的 XMind 文件
+            if "content.json" not in written:
+                zout.writestr("content.json", new_content)
+                written.add("content.json")
+
+            # 新增资源（如插入的图片）
+            for name, data in self._extra_files.items():
+                if name not in written:
+                    zout.writestr(name, data)
+                    written.add(name)
+
+            # manifest 登记所有文件（目录项不登记）
+            entries = manifest.setdefault("file-entries", {})
+            for name in written:
+                if name != "manifest.json" and not name.endswith("/"):
+                    entries.setdefault(name, {})
+            zout.writestr(
+                "manifest.json",
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+            )
 
         # 更新内部缓存
         with open(output_path, "rb") as f:
@@ -1020,25 +1388,328 @@ class XMindWriter:
         text_align）。
         """
         keyword_lower = keyword.lower()
-        matched_ids = [
-            n.id for n in self.xm.all_topics()
-            if keyword_lower in n.title.lower()
-        ]
-        if not matched_ids:
-            return []
+        # 样式参数先整体校验一次，任何非法值都在修改前抛出，
+        # 保证批量操作不会“改到一半才失败”。
+        style_updates = _prepare_style_updates(style) if style else {}
+        matched_ids: list[str] = []
 
-        for node_id in matched_ids:
-            if style:
-                self.set_node_style(node_id, **style)
-            for marker in add_markers or []:
-                self.add_marker(node_id, marker)
-            for marker in remove_markers or []:
-                self.remove_marker(node_id, marker)
-            for label in add_labels or []:
-                self.add_label(node_id, label)
-            for label in remove_labels or []:
-                self.remove_label(node_id, label)
+        def _walk(topic: dict) -> None:
+            title = topic.get("title") or ""
+            if keyword_lower in title.lower():
+                topic_id = topic.get("id")
+                if topic_id:
+                    matched_ids.append(topic_id)
+                if style_updates:
+                    self._set_topic_style_dict(topic, style_updates)
+                for marker in add_markers or []:
+                    self._add_marker_to_topic(topic, marker)
+                for marker in remove_markers or []:
+                    self._remove_marker_from_topic(topic, marker)
+                for label in add_labels or []:
+                    self._add_label_to_topic(topic, label)
+                for label in remove_labels or []:
+                    self._remove_label_from_topic(topic, label)
+            children = topic.get("children", {})
+            if isinstance(children, dict):
+                for key in ("attached", "detached", "summary", "callout"):
+                    for child in children.get(key, []):
+                        if isinstance(child, dict):
+                            _walk(child)
+
+        for sheet in self.xm.raw_content:
+            root = sheet.get("rootTopic") if isinstance(sheet, dict) else None
+            if isinstance(root, dict):
+                _walk(root)
+        if matched_ids:
+            # 只刷新一次解析树，避免每节点全树查找 + 全量刷新（O(n²)）
+            self.xm.refresh_from_raw()
         return matched_ids
+
+    def batch_update_titles(
+        self,
+        find: str,
+        replace: str,
+        use_regex: bool = False,
+    ) -> list[tuple[str, str, str]]:
+        """按文本或正则批量替换节点标题，返回 (id, 旧标题, 新标题)。"""
+        if not find:
+            raise ValueError("find 不能为空")
+        pattern = None
+        if use_regex:
+            try:
+                pattern = re.compile(find)
+            except re.error as e:
+                raise ValueError(f"正则表达式无效: {e}") from e
+
+        changes: list[tuple[str, str, str]] = []
+
+        def _walk(topic: dict) -> None:
+            title = topic.get("title")
+            if isinstance(title, str):
+                if pattern is not None:
+                    new_title = pattern.sub(replace, title)
+                else:
+                    new_title = title.replace(find, replace)
+                if new_title != title:
+                    topic["title"] = new_title
+                    changes.append((topic.get("id", ""), title, new_title))
+            children = topic.get("children", {})
+            if isinstance(children, dict):
+                for key in ("attached", "detached", "summary", "callout"):
+                    for child in children.get(key, []):
+                        if isinstance(child, dict):
+                            _walk(child)
+
+        for sheet in self.xm.raw_content:
+            root = sheet.get("rootTopic") if isinstance(sheet, dict) else None
+            if isinstance(root, dict):
+                _walk(root)
+        if changes:
+            self.xm.refresh_from_raw()
+        return changes
+
+    def delete_empty_nodes(self) -> list[str]:
+        """删除所有空标题的普通节点（含其子树），跳过根/概要/批注。返回被删 ID。"""
+        deleted: list[str] = []
+        removed_ids: set[str] = set()
+        affected: dict[int, tuple[dict, list[str]]] = {}
+
+        def _collect(topic: dict) -> None:
+            children = topic.get("children", {})
+            if not isinstance(children, dict):
+                return
+            for key in ("attached", "detached", "summary", "callout"):
+                for child in children.get(key, []):
+                    if not isinstance(child, dict):
+                        continue
+                    if key in ("attached", "detached") and not (child.get("title") or "").strip():
+                        if child.get("id"):
+                            deleted.append(child["id"])
+                    else:
+                        _collect(child)
+
+        for sheet in self.xm.raw_content:
+            root = sheet.get("rootTopic") if isinstance(sheet, dict) else None
+            if isinstance(root, dict):
+                _collect(root)
+
+        for topic_id in deleted:
+            topic_dict, parent_dict, _ = _find_topic_and_parent(self.xm.raw_content, topic_id)
+            if topic_dict is None or parent_dict is None:
+                continue
+            parent_key = id(parent_dict)
+            if parent_key not in affected:
+                affected[parent_key] = (parent_dict, _attached_ids(parent_dict))
+            removed_ids |= topic_ids_in_subtree(topic_dict)
+            _remove_topic_from_parent(parent_dict, topic_id)
+
+        if removed_ids:
+            _cleanup_dangling_refs(self.xm.raw_content, removed_ids)
+            for parent_dict, old_ids in affected.values():
+                _remap_visual_ranges(parent_dict, old_ids)
+            self.xm.refresh_from_raw()
+        return deleted
+
+    def merge_duplicate_nodes(self) -> list[tuple[str, str]]:
+        """合并整张图中标题相同的兄弟节点（保留第一个，子节点并入）。
+
+        返回 [(保留节点 ID, 被合并节点 ID), ...]。
+        """
+        merged: list[tuple[str, str]] = []
+        removed_ids: set[str] = set()
+        affected: dict[int, tuple[dict, list[str]]] = {}
+
+        def _walk(topic: dict) -> None:
+            nonlocal removed_ids
+            children = topic.get("children", {})
+            if isinstance(children, dict):
+                attached = children.get("attached", [])
+                groups: dict[str, list[dict]] = {}
+                for child in attached:
+                    if isinstance(child, dict):
+                        key = (child.get("title") or "").strip()
+                        if key:
+                            groups.setdefault(key, []).append(child)
+                for group in groups.values():
+                    if len(group) <= 1:
+                        continue
+                    keep = group[0]
+                    parent_key = id(topic)
+                    if parent_key not in affected:
+                        affected[parent_key] = (topic, _attached_ids(topic))
+                    for dup in group[1:]:
+                        dup_id = dup.get("id")
+                        if not dup_id:
+                            continue
+                        dup_children = dup.get("children", {})
+                        if isinstance(dup_children, dict):
+                            keep_children = keep.get("children")
+                            if not isinstance(keep_children, dict):
+                                keep_children = {}
+                                keep["children"] = keep_children
+                            for key in ("attached", "detached", "summary", "callout"):
+                                items = dup_children.get(key, [])
+                                if items:
+                                    keep_children.setdefault(key, []).extend(items)
+                        removed_ids |= topic_ids_in_subtree(dup)
+                        _remove_topic_from_parent(topic, dup_id)
+                        merged.append((keep.get("id", ""), dup_id))
+                for key in ("attached", "detached", "summary", "callout"):
+                    for child in children.get(key, []):
+                        if isinstance(child, dict):
+                            _walk(child)
+
+        for sheet in self.xm.raw_content:
+            root = sheet.get("rootTopic") if isinstance(sheet, dict) else None
+            if isinstance(root, dict):
+                _walk(root)
+
+        if removed_ids:
+            _cleanup_dangling_refs(self.xm.raw_content, removed_ids)
+            for parent_dict, old_ids in affected.values():
+                _remap_visual_ranges(parent_dict, old_ids)
+            self.xm.refresh_from_raw()
+        return merged
+
+    def notes_to_children(self, node_id: str, keep_notes: bool = False) -> int:
+        """把节点备注的每一行转成一个子节点。默认转换后清空备注。"""
+        topic_dict, _, kind = _find_topic_and_parent(self.xm.raw_content, node_id)
+        if topic_dict is None:
+            raise ValueError(f"找不到节点: {node_id}")
+        if kind in ("summary", "callout"):
+            raise ValueError("不能给概要或批注节点转换备注")
+        notes = _raw_notes_text(topic_dict)
+        lines = [line.strip() for line in notes.splitlines() if line.strip()]
+        if not lines:
+            raise ValueError("该节点没有可转换的备注文本")
+
+        attached = _ensure_children_attached(topic_dict)
+        old_ids = _attached_ids(topic_dict)
+        for line in lines:
+            attached.append({
+                "id": str(uuid.uuid4()),
+                "title": line,
+                "class": "topic",
+                "children": {"attached": [], "detached": []},
+            })
+        _remap_visual_ranges(topic_dict, old_ids)
+        if not keep_notes:
+            topic_dict.pop("notes", None)
+        self.xm.refresh_from_raw()
+        return len(lines)
+
+    def children_to_notes(self, node_id: str, keep_children: bool = False) -> int:
+        """把节点的直接子节点标题合并成备注。默认转换后删除子节点。"""
+        topic_dict, _, kind = _find_topic_and_parent(self.xm.raw_content, node_id)
+        if topic_dict is None:
+            raise ValueError(f"找不到节点: {node_id}")
+        if kind in ("summary", "callout"):
+            raise ValueError("不能给概要或批注节点转换子节点")
+        children = topic_dict.get("children", {})
+        attached = children.get("attached", []) if isinstance(children, dict) else []
+        titles = [
+            child.get("title")
+            for child in attached
+            if isinstance(child, dict) and (child.get("title") or "").strip()
+        ]
+        if not titles:
+            raise ValueError("该节点没有可转换的子节点")
+
+        _set_notes(topic_dict, "\n".join(titles))
+        if not keep_children:
+            old_ids = _attached_ids(topic_dict)
+            removed_ids: set[str] = set()
+            for child in attached:
+                if isinstance(child, dict):
+                    removed_ids |= topic_ids_in_subtree(child)
+            if isinstance(children, dict):
+                children["attached"] = []
+            _cleanup_dangling_refs(self.xm.raw_content, removed_ids)
+            _remap_visual_ranges(topic_dict, old_ids)
+        self.xm.refresh_from_raw()
+        return len(titles)
+
+    def auto_number(self, mode: str = "decimal") -> int:
+        """给节点自动编号。
+
+        mode="decimal"：每个父节点下按 1. 2. 3. … 编号；
+        mode="hierarchical"：按 1. / 1.1. / 1.1.1. … 层级编号。
+        已有编号会被替换（避免出现 “1. 1. 标题”）。只编普通子节点。
+        """
+        if mode not in ("decimal", "hierarchical"):
+            raise ValueError("mode 只支持 decimal 或 hierarchical")
+        count = 0
+
+        def _strip_number(title: str) -> str:
+            stripped = re.sub(r"^\s*\d+(\.\d+)*\s*[\.、)）]?\s*", "", title).strip()
+            return stripped or title
+
+        def _walk(topic: dict, parent_num: str = "") -> None:
+            nonlocal count
+            children = topic.get("children", {})
+            if not isinstance(children, dict):
+                return
+            attached = children.get("attached", [])
+            for index, child in enumerate(attached):
+                if not isinstance(child, dict):
+                    continue
+                title = child.get("title") or ""
+                if mode == "decimal":
+                    child["title"] = f"{index + 1}. {_strip_number(title)}"
+                    num = ""
+                else:
+                    num = f"{index + 1}" if not parent_num else f"{parent_num}.{index + 1}"
+                    child["title"] = f"{num}. {_strip_number(title)}"
+                count += 1
+                _walk(child, num)
+            for key in ("detached", "summary", "callout"):
+                for child in children.get(key, []):
+                    if isinstance(child, dict):
+                        _walk(child, "")
+
+        for sheet in self.xm.raw_content:
+            root = sheet.get("rootTopic") if isinstance(sheet, dict) else None
+            if isinstance(root, dict):
+                _walk(root)
+        if count:
+            self.xm.refresh_from_raw()
+        return count
+
+    def remove_unused_attachments(self) -> list[str]:
+        """找出 zip 中未被任何节点引用的附件/图片，保存时移除。返回移除列表。"""
+        referenced: set[str] = set()
+
+        def _walk(topic: dict) -> None:
+            image = topic.get("image")
+            if isinstance(image, dict):
+                src = image.get("src") or ""
+                if src.startswith("xap:"):
+                    referenced.add(src[4:])
+            children = topic.get("children", {})
+            if isinstance(children, dict):
+                for key in ("attached", "detached", "summary", "callout"):
+                    for child in children.get(key, []):
+                        if isinstance(child, dict):
+                            _walk(child)
+
+        for sheet in self.xm.raw_content:
+            root = sheet.get("rootTopic") if isinstance(sheet, dict) else None
+            if isinstance(root, dict):
+                _walk(root)
+
+        unused: list[str] = []
+        if self.xm._zip_bytes:
+            try:
+                with zipfile.ZipFile(io.BytesIO(self.xm._zip_bytes)) as zf:
+                    for name in zf.namelist():
+                        if name.endswith("/"):
+                            continue
+                        if name.startswith(("attachments/", "resources/")) and name not in referenced:
+                            unused.append(name)
+            except zipfile.BadZipFile:
+                pass
+        self._exclude_files.update(unused)
+        return unused
 
     @classmethod
     def create(
@@ -1075,37 +1746,11 @@ class XMindWriter:
             topic["children"]["attached"] = [_build_topic(c) for c in children]
             return topic
 
-        root_id = str(uuid.uuid4())
-        root = {
-            "id": root_id,
-            "title": root_title,
-            "class": "topic",
-            "titleUnedited": True,
-            "structureClass": "org.xmind.ui.map.clockwise",
-            "children": {
-                "attached": [_build_topic(t) for t in (topics or [])],
-                "detached": [],
-            },
-        }
-        sheet_id = str(uuid.uuid4())
-        sheet = {
-            "id": sheet_id,
-            "revisionId": str(uuid.uuid4()),
-            "class": "sheet",
-            "title": sheet_title,
-            "rootTopic": root,
-            "relationships": [],
-            "topicOverlapping": "overlap",
-            "arrangeableLayerOrder": [root_id],
-            "zones": [],
-            "extensions": [
-                {
-                    "provider": "org.xmind.ui.skeleton.structure.style",
-                    "content": {"centralTopic": "org.xmind.ui.map.clockwise"},
-                }
-            ],
-            "theme": _new_theme(),
-        }
+        sheet = cls._new_sheet(
+            sheet_title,
+            root_title,
+            [_build_topic(t) for t in (topics or [])],
+        )
         content = [sheet]
 
         zip_bytes = io.BytesIO()
@@ -1135,6 +1780,9 @@ class XMindWriter:
                     indent=2,
                 ),
             )
+        # 覆盖已有文件前先备份，和 save() 的行为保持一致
+        if Path(output_path).exists():
+            _backup_file(output_path)
         with open(output_path, "wb") as f:
             f.write(zip_bytes.getvalue())
 
@@ -1160,21 +1808,65 @@ class XMindWriter:
         input_path: Union[str, Path],
         output_path: Optional[Union[str, Path]] = None,
     ) -> "XMindWriter":
-        """修复打不开的 XMind 文件：补全 metadata.json / content.xml / theme / revisionId。
+        """修复打不开的 XMind 文件。
 
-        不改变主题内容；output_path 为 None 时原地覆盖（保存前会自动备份原文件）。
+        - content.json 可解析：补全 metadata.json / content.xml / theme / revisionId，
+          不改变已有主题内容。
+        - content.json 缺失或损坏：重建一个空白画布，并保留 zip 里的
+          附件/标记等资源，让文件至少能被 XMind 打开。
+        output_path 为 None 时原地覆盖（保存前会自动备份原文件）。
         """
-        xm = parse_xmind(input_path)
-        for sheet in xm.raw_content:
-            if not isinstance(sheet, dict):
-                continue
-            sheet.setdefault("revisionId", str(uuid.uuid4()))
-            sheet.setdefault("theme", _new_theme())
-            root = sheet.get("rootTopic")
-            if isinstance(root, dict):
-                root.setdefault("titleUnedited", True)
-                root.setdefault("structureClass", "org.xmind.ui.map.clockwise")
-                _ensure_topic_class(root)
+        try:
+            xm = parse_xmind(input_path)
+        except (ValueError, json.JSONDecodeError, zipfile.BadZipFile, KeyError):
+            # 原文件无法解析：重建最小可打开的内容，保留其余 zip 资源。
+            with open(input_path, "rb") as f:
+                zip_bytes = f.read()
+            root_id = str(uuid.uuid4())
+            sheet_id = str(uuid.uuid4())
+            root = {
+                "id": root_id,
+                "title": "未命名",
+                "class": "topic",
+                "titleUnedited": True,
+                "structureClass": "org.xmind.ui.map.clockwise",
+                "children": {"attached": [], "detached": []},
+            }
+            content = [{
+                "id": sheet_id,
+                "revisionId": str(uuid.uuid4()),
+                "class": "sheet",
+                "title": "已修复的画布",
+                "rootTopic": root,
+                "relationships": [],
+                "topicOverlapping": "overlap",
+                "arrangeableLayerOrder": [root_id],
+                "zones": [],
+                "extensions": [{
+                    "provider": "org.xmind.ui.skeleton.structure.style",
+                    "content": {"centralTopic": "org.xmind.ui.map.clockwise"},
+                }],
+                "theme": _new_theme(),
+            }]
+            xm = XMindFile(
+                path=str(input_path),
+                sheets=[],
+                raw_content=content,
+                zip_namelist=[],
+                _zip_bytes=zip_bytes,
+            )
+            xm.refresh_from_raw()
+        else:
+            for sheet in xm.raw_content:
+                if not isinstance(sheet, dict):
+                    continue
+                sheet.setdefault("revisionId", str(uuid.uuid4()))
+                sheet.setdefault("theme", _new_theme())
+                root = sheet.get("rootTopic")
+                if isinstance(root, dict):
+                    root.setdefault("titleUnedited", True)
+                    root.setdefault("structureClass", "org.xmind.ui.map.clockwise")
+                    _ensure_topic_class(root)
         writer = cls(xm)
         target = str(output_path) if output_path is not None else xm.path
         writer.save(target)

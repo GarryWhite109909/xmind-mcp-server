@@ -26,6 +26,8 @@
 
   美化类:
     set_node_style    — 设置节点字体/颜色/背景/边框等
+    set_branch_style  — 设置分支连线类型/终点样式/粗细/颜色
+    set_theme_style   — 设置主题级默认样式（中心/分支/细分/自由主题）
     set_sheet_layout  — 切换工作表的布局结构（顺时针/逻辑图等）
     apply_style_preset— 一键套用配色预设（清新蓝/暖阳橙/莫兰迪绿）
     set_hyperlink     — 设置/移除超链接
@@ -51,9 +53,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import re
+import threading
+import zipfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -62,7 +67,8 @@ from mcp import types
 from .config import Config
 from .hardware.installer import verify_installed
 from .xmind_parser import parse_xmind, load_topic_image, XMindFile, TopicNode
-from .xmind_writer import XMindWriter
+from .xmind_props import THEME_LEVELS
+from .xmind_writer import XMindWriter, list_backups, restore_backup
 from .ocr.manager import OCRManager
 
 
@@ -74,22 +80,26 @@ class XMindWorkspace:
     def __init__(self):
         # {path: (mtime, XMindFile, XMindWriter)}
         self._cache: dict[str, tuple[float, XMindFile, XMindWriter]] = {}
+        # MCP 可能并发调用，缓存读写加锁避免同一文件被两个请求同时改写
+        self._lock = threading.Lock()
 
     def get(self, path: str) -> tuple[XMindFile, XMindWriter]:
         path = os.path.abspath(path)
         mtime = os.path.getmtime(path)
 
-        cached = self._cache.get(path)
-        if cached and cached[0] == mtime:
-            return cached[1], cached[2]
+        with self._lock:
+            cached = self._cache.get(path)
+            if cached and cached[0] == mtime:
+                return cached[1], cached[2]
 
-        xm = parse_xmind(path)
-        writer = XMindWriter(xm)
-        self._cache[path] = (mtime, xm, writer)
-        return xm, writer
+            xm = parse_xmind(path)
+            writer = XMindWriter(xm)
+            self._cache[path] = (mtime, xm, writer)
+            return xm, writer
 
     def invalidate(self, path: str) -> None:
-        self._cache.pop(os.path.abspath(path), None)
+        with self._lock:
+            self._cache.pop(os.path.abspath(path), None)
 
     def refresh_after_save(self, path: str) -> tuple[XMindFile, XMindWriter]:
         """保存后刷新缓存。"""
@@ -98,6 +108,18 @@ class XMindWorkspace:
 
 
 # ---------- 格式化辅助 ----------
+
+# 单次输出里备注/OCR 文本的最大长度，防止超长内容撑爆模型上下文
+MAX_NOTE_CHARS = 2000
+MAX_OCR_CHARS = 2000
+
+
+def _truncate(text: str, limit: int, hint: str = "已截断") -> str:
+    """超长文本截断并标注，保留完整内容的获取路径由调用方提示。"""
+    if text is None or len(text) <= limit:
+        return text
+    return text[:limit] + f"…（{hint}）"
+
 
 def _clean_title(title: str) -> str:
     """清理节点标题中的换行和多余空白。"""
@@ -141,7 +163,8 @@ def _format_node_line(node: TopicNode, include_ids: bool, show_images: bool, cle
 
 def _format_multiline(text: str, prefix: str) -> str:
     """保留多行文本的换行，并为续行加上树形缩进前缀。"""
-    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = _truncate(text or "", MAX_NOTE_CHARS, "备注过长已截断，可用 get_node 查看完整内容")
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
         return ""
     lines = text.split("\n")
@@ -232,6 +255,31 @@ def _format_node(
         )
 
 
+def _iter_visible_topics(
+    xm: XMindFile,
+    max_depth: Optional[int] = None,
+    max_nodes: Optional[int] = None,
+):
+    """按输出顺序遍历“会被渲染出来”的节点（与树格式化共用相同的截断规则）。
+
+    供 read_all 决定哪些图片需要 OCR：max_depth/max_nodes 之外的图片
+    不会出现在输出里，也就不必花时间识别。
+    """
+    count = 0
+    for sheet in xm.sheets:
+        stack = [sheet.root]
+        while stack:
+            node = stack.pop()
+            if max_nodes is not None and count >= max_nodes:
+                return
+            count += 1
+            yield node
+            if max_depth is not None and node.level >= max_depth:
+                continue
+            for child in reversed(node.children):
+                stack.append(child)
+
+
 def _build_node_path(node: TopicNode, xm: XMindFile) -> str:
     """构建节点的标题路径，如 '根主题/分支主题/子节点'。"""
     parts = []
@@ -248,21 +296,37 @@ def _build_node_path(node: TopicNode, xm: XMindFile) -> str:
 
 
 def _effective_style(node: TopicNode, xm: XMindFile) -> dict:
-    """合并“工作表主题里该主题类型的样式 + 节点自身样式”。
+    """合并“工作表主题里的层级/类型默认样式 + 节点自身样式”。
 
+    顺序：主题层级默认样式（中心/分支/第三层/细分/自由主题）
+    → 主题类型样式（importantTopic 等）
+    → 节点自身样式（后者覆盖前者）。
     例如 importantTopic 主题自带紫色填充/加粗，节点自身只写了字体和形状，
     合并后模型才能看到这个节点实际长什么样。
     """
     props: dict[str, str] = {}
-    if node.xmind_class and node.sheet_index < len(xm.raw_content):
+    if node.sheet_index < len(xm.raw_content):
         sheet = xm.raw_content[node.sheet_index]
         theme = sheet.get("theme") if isinstance(sheet, dict) else None
         if isinstance(theme, dict):
-            class_theme = theme.get(node.xmind_class)
-            if isinstance(class_theme, dict):
-                class_props = class_theme.get("properties")
-                if isinstance(class_props, dict):
-                    props.update(class_props)
+            theme_keys: list[str] = []
+            if node.topic_class == "detached":
+                theme_keys.append("floatingTopic")
+            elif node.topic_class not in ("summary", "callout"):
+                level_key = {
+                    0: "centralTopic",
+                    1: "mainTopic",
+                    2: "subTopic",
+                }.get(node.level, "level3")
+                theme_keys.append(level_key)
+            if node.xmind_class and node.xmind_class != "topic":
+                theme_keys.append(node.xmind_class)
+            for key in theme_keys:
+                entry = theme.get(key)
+                if isinstance(entry, dict):
+                    entry_props = entry.get("properties")
+                    if isinstance(entry_props, dict):
+                        props.update(entry_props)
     node_props = (node.style or {}).get("properties")
     if isinstance(node_props, dict):
         props.update(node_props)
@@ -413,7 +477,7 @@ def build_tool_list() -> list[types.Tool]:
         ),
         _tool(
             "repair_file",
-            "修复打不开的 XMind 文件：自动补全 metadata.json、content.xml、默认主题、revisionId 等 XMind 必需内容，不改变已有主题和样式。覆盖保存前会自动备份原文件。",
+            "修复打不开的 XMind 文件：自动补全 metadata.json、content.xml、默认主题、revisionId 等 XMind 必需内容；若 content.json 缺失或损坏，会重建空白画布并保留 zip 内的附件资源。覆盖保存前会自动备份原文件。",
             {
                 "file_path": file_path_prop,
                 "output_path": {"type": "string", "description": "修复后另存的路径（可选，省略则覆盖原文件）"},
@@ -486,19 +550,26 @@ def build_tool_list() -> list[types.Tool]:
                         "font_family": {"type": "string"},
                         "font_weight": {"type": "string"},
                         "font_style": {"type": "string"},
+                        "font_transform": {"type": "string"},
+                        "font_decoration": {"type": "string"},
                         "background_color": {"type": "string"},
+                        "fill_pattern": {"type": "string"},
                         "border_color": {"type": "string"},
                         "border_width": {"type": "string"},
+                        "border_pattern": {"type": "string"},
                         "shape": {"type": "string"},
                         "line_color": {"type": "string"},
                         "line_width": {"type": "string"},
+                        "line_pattern": {"type": "string"},
                         "text_align": {"type": "string"},
+                        "importance": {"type": "string"},
                     },
                 },
                 "add_markers": {"type": "array", "items": {"type": "string"}, "description": "要添加的标记 ID 列表"},
                 "remove_markers": {"type": "array", "items": {"type": "string"}, "description": "要移除的标记 ID 列表"},
                 "add_labels": {"type": "array", "items": {"type": "string"}, "description": "要添加的标签列表"},
                 "remove_labels": {"type": "array", "items": {"type": "string"}, "description": "要移除的标签列表"},
+                "preview": {"type": "boolean", "description": "只返回将影响的节点，不实际修改（默认 false）"},
                 "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
             },
             ["file_path", "keyword"],
@@ -514,33 +585,82 @@ def build_tool_list() -> list[types.Tool]:
         ),
         _tool(
             "set_node_style",
-            "设置节点样式：字体、字号、文字颜色、加粗、斜体、背景色、边框色/宽度、节点形状、连线颜色/宽度、对齐。传 None 表示不修改该项。颜色用 #RRGGBB 十六进制。",
+            "设置节点样式：重要程度（极其重要/重要/删去/默认）、字体、字号（8/10/12/14/18/24/36/48/60）、文字颜色、加粗/斜体/删除线/下划线/大小写变换、背景色、边框色/线型/宽度、节点形状（矩形/圆角矩形/下划线/双下划线/圆形/椭圆形/菱形/平行四边形/跑道/切角矩形/六边形/竖胶囊）、连线颜色/线宽、对齐。传 None 表示不修改该项。颜色用 #RRGGBB、#RRGGBBAA 或「4E0D58 60%」透明度写法。",
             {
                 "file_path": file_path_prop,
                 "node_id": {"type": "string", "description": "要设置样式的节点 ID"},
-                "font_color": {"type": "string", "description": "文字颜色，如 #FF0000"},
-                "font_size": {"type": "string", "description": "字号，如 12pt / 16pt"},
+                "importance": {"type": "string", "description": "重要程度：极其重要 / 重要 / 删去 / 默认"},
+                "font_color": {"type": "string", "description": "文字颜色，如 #FF0000 或 4E0D58 60%"},
+                "font_size": {"type": "string", "description": "字号：8 / 10 / 12 / 14 / 18 / 24 / 36 / 48 / 60 或 16pt"},
                 "font_family": {"type": "string", "description": "字体族，如 Arial / 微软雅黑"},
-                "font_weight": {"type": "string", "description": "加粗，如 bold / normal"},
-                "font_style": {"type": "string", "description": "斜体，如 italic / normal"},
-                "background_color": {"type": "string", "description": "背景色，如 #FFF3BF"},
+                "font_weight": {"type": "string", "description": "加粗：加粗 / 正常（或 bold / normal）"},
+                "font_style": {"type": "string", "description": "斜体：斜体 / 正常（或 italic / normal）"},
+                "font_transform": {"type": "string", "description": "大小写：默认 / 全大写 / 全小写 / 首字母大写"},
+                "font_decoration": {"type": "string", "description": "文字装饰：下划线 / 删除线 / 无，可叠加如「下划线+删除线」"},
+                "background_color": {"type": "string", "description": "背景色，如 #FFF3BF 或 4E0D58 60%"},
+                "fill_pattern": {"type": "string", "description": "填充样式：无 / 纯色 / 手绘 / 交叉线 / 细交叉线 / 影线 / 细影线"},
                 "border_color": {"type": "string", "description": "边框色，如 #000000"},
-                "border_width": {"type": "string", "description": "边框宽度，如 2pt"},
-                "shape": {"type": "string", "description": "节点形状，如 org.xmind.topicShape.roundedRect / ellipse"},
+                "border_width": {"type": "string", "description": "边框宽度：极细 / 细 / 中等 / 粗 / 极粗，或 2pt"},
+                "border_pattern": {"type": "string", "description": "边框线型：实线 / 虚线 / 点线 / 点划线 / 无"},
+                "shape": {"type": "string", "description": "节点形状：矩形 / 圆角矩形 / 下划线 / 双下划线 / 圆形 / 椭圆形 / 菱形 / 平行四边形 / 跑道 / 切角矩形 / 六边形 / 竖胶囊"},
                 "line_color": {"type": "string", "description": "分支连线颜色，如 #FF6B6B"},
-                "line_width": {"type": "string", "description": "分支连线宽度，如 2pt"},
-                "text_align": {"type": "string", "description": "对齐，如 left / center / right"},
+                "line_width": {"type": "string", "description": "分支连线宽度：极细 / 细 / 中等 / 粗 / 极粗，或 2pt"},
+                "line_pattern": {"type": "string", "description": "连线线型：实线 / 虚线 / 点线 / 点划线 / 无"},
+                "text_align": {"type": "string", "description": "对齐：左对齐 / 居中 / 右对齐 / 默认"},
                 "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
             },
             ["file_path", "node_id"],
         ),
         _tool(
             "set_sheet_layout",
-            "切换工作表的布局结构。常用：org.xmind.ui.map.clockwise（顺时针思维导图）、org.xmind.ui.map.unclockwise（逆时针）、org.xmind.ui.logic.right（逻辑图向右）、org.xmind.ui.tree.right（树形图向右）、org.xmind.ui.org-chart.down（组织结构图向下）。",
+            "切换工作表的布局结构，支持中文名：思维导图 / 逻辑图 / 括号图 / 组织结构图 / 树形图 / 时间轴 / 鱼骨图 / 矩阵图 / 树型表格，也支持 XMind 内部 ID。",
             {
                 "file_path": file_path_prop,
                 "sheet_index": {"type": "integer", "description": "工作表索引，从 0 开始（默认 0）"},
-                "layout": {"type": "string", "description": "布局结构 ID（默认 org.xmind.ui.map.clockwise）"},
+                "layout": {"type": "string", "description": "布局结构（默认 思维导图）"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path"],
+        ),
+        _tool(
+            "set_branch_style",
+            "设置某个节点向外分支的连线样式：分支类型（圆角折线/折线/直线/曲线/圆弧/手绘/圆角手绘）、终点样式（圆点/三角形/菱形/双箭头等）、粗细（极细/细/中等/粗/极粗）、颜色、线型。",
+            {
+                "file_path": file_path_prop,
+                "node_id": {"type": "string", "description": "要设置分支样式的节点 ID"},
+                "line_type": {"type": "string", "description": "分支类型：圆角折线 / 折线 / 直线 / 曲线 / 圆弧 / 手绘 / 圆角手绘"},
+                "arrow_end": {"type": "string", "description": "终点样式：无 / 圆点 / 三角形 / 矛头 / 方形 / 菱形 / 鱼骨 / 双箭头 / 反三角 / 附着 / 钩形"},
+                "line_color": {"type": "string", "description": "连线颜色，如 #FF6B6B 或 4E0D58 60%"},
+                "line_width": {"type": "string", "description": "线宽：极细 / 细 / 中等 / 粗 / 极粗，或 2pt"},
+                "line_pattern": {"type": "string", "description": "线型：实线 / 虚线 / 点线 / 点划线 / 无"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path", "node_id"],
+        ),
+        _tool(
+            "set_theme_style",
+            "设置主题级默认样式，影响整个层级的节点：中心主题 / 分支主题 / 第三层级主题 / 细分主题 / 自由主题。参数与 set_node_style 一致（font_color、font_size、shape、background_color 等，不含 importance）。",
+            {
+                "file_path": file_path_prop,
+                "sheet_index": {"type": "integer", "description": "工作表索引，从 0 开始（默认 0）"},
+                "level": {"type": "string", "description": "主题层级：中心主题 / 分支主题 / 第三层级主题 / 细分主题 / 自由主题"},
+                "font_color": {"type": "string"},
+                "font_size": {"type": "string"},
+                "font_family": {"type": "string"},
+                "font_weight": {"type": "string"},
+                "font_style": {"type": "string"},
+                "font_transform": {"type": "string"},
+                "font_decoration": {"type": "string"},
+                "background_color": {"type": "string"},
+                "fill_pattern": {"type": "string"},
+                "border_color": {"type": "string"},
+                "border_width": {"type": "string"},
+                "border_pattern": {"type": "string"},
+                "shape": {"type": "string"},
+                "line_color": {"type": "string"},
+                "line_width": {"type": "string"},
+                "line_pattern": {"type": "string"},
+                "text_align": {"type": "string"},
                 "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
             },
             ["file_path"],
@@ -625,6 +745,7 @@ def build_tool_list() -> list[types.Tool]:
                     "enum": ["清新蓝", "暖阳橙", "莫兰迪绿"],
                     "description": "配色预设名称",
                 },
+                "preview": {"type": "boolean", "description": "只返回将影响的节点统计，不实际修改（默认 false）"},
                 "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
             },
             ["file_path", "preset"],
@@ -713,6 +834,167 @@ def build_tool_list() -> list[types.Tool]:
             {},
             [],
         ),
+        _tool(
+            "list_backups",
+            "列出某个 xmind 文件已有的自动备份（新到旧），包含路径、大小和时间。",
+            {"file_path": file_path_prop},
+            ["file_path"],
+        ),
+        _tool(
+            "restore_backup",
+            "把指定备份恢复到目标文件（覆盖前会把当前文件再备份一份，保证可逆）。",
+            {
+                "file_path": file_path_prop,
+                "backup_path": {"type": "string", "description": "要恢复的备份文件路径，可用 list_backups 获取"},
+            },
+            ["file_path", "backup_path"],
+        ),
+        _tool(
+            "export_svg",
+            "把节点树导出为示意图 SVG 文件（用于人工查看美化效果；模型可继续用 analyze_style 获取结构化反馈）。",
+            {
+                "file_path": file_path_prop,
+                "output_path": {"type": "string", "description": "SVG 输出路径（可选，默认与源文件同名的 .svg）"},
+            },
+            ["file_path"],
+        ),
+        _tool(
+            "analyze_style",
+            "样式审计：输出当前工作表各主题层级的默认样式、整张图的颜色/字体/形状使用统计，可选列出每个节点的有效样式。",
+            {
+                "file_path": file_path_prop,
+                "sheet_index": {"type": "integer", "description": "工作表索引（默认 0）"},
+                "include_node_styles": {"type": "boolean", "description": "是否列出节点级有效样式（默认 false）"},
+                "max_nodes": {"type": "integer", "description": "include_node_styles 时最多列出多少个节点（默认 50）"},
+            },
+            ["file_path"],
+        ),
+        _tool(
+            "list_attachments",
+            "列出 xmind 包内的附件/图片资源，标注哪些被节点引用、哪些未被引用。",
+            {"file_path": file_path_prop},
+            ["file_path"],
+        ),
+        _tool(
+            "remove_unused_attachments",
+            "找出未被任何节点引用的附件/图片，保存时移除，减小文件体积。",
+            {
+                "file_path": file_path_prop,
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path"],
+        ),
+        _tool(
+            "batch_update_titles",
+            "按关键词或正则批量替换节点标题，返回被修改的节点。",
+            {
+                "file_path": file_path_prop,
+                "find": {"type": "string", "description": "要查找的文本或正则表达式"},
+                "replace": {"type": "string", "description": "替换为的文本"},
+                "use_regex": {"type": "boolean", "description": "是否把 find 当作正则表达式（默认 false）"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path", "find", "replace"],
+        ),
+        _tool(
+            "delete_empty_nodes",
+            "删除所有空标题的普通节点（含其子树），跳过根主题和概要/批注节点。",
+            {
+                "file_path": file_path_prop,
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path"],
+        ),
+        _tool(
+            "merge_duplicate_nodes",
+            "合并标题相同的兄弟节点：保留第一个，其余节点的子节点并入后删除。",
+            {
+                "file_path": file_path_prop,
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path"],
+        ),
+        _tool(
+            "notes_to_children",
+            "把节点备注的每一行转成一个子节点（默认转换后清空备注）。",
+            {
+                "file_path": file_path_prop,
+                "node_id": {"type": "string", "description": "要转换的节点 ID"},
+                "keep_notes": {"type": "boolean", "description": "转换后是否保留原备注（默认 false）"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path", "node_id"],
+        ),
+        _tool(
+            "children_to_notes",
+            "把节点的直接子节点标题合并成备注（默认转换后删除子节点）。",
+            {
+                "file_path": file_path_prop,
+                "node_id": {"type": "string", "description": "要转换的节点 ID"},
+                "keep_children": {"type": "boolean", "description": "转换后是否保留子节点（默认 false）"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path", "node_id"],
+        ),
+        _tool(
+            "auto_number",
+            "给节点自动编号：decimal 按每个父节点 1.2.3. 编号；hierarchical 按 1. / 1.1. / 1.1.1. 层级编号。已有编号会被替换。",
+            {
+                "file_path": file_path_prop,
+                "mode": {"type": "string", "enum": ["decimal", "hierarchical"], "description": "编号方式（默认 decimal）"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path"],
+        ),
+        _tool(
+            "list_sheets",
+            "列出文件中的所有工作表：索引、标题、根主题、节点数。",
+            {"file_path": file_path_prop},
+            ["file_path"],
+        ),
+        _tool(
+            "add_sheet",
+            "新增一张工作表。",
+            {
+                "file_path": file_path_prop,
+                "title": {"type": "string", "description": "工作表标题（可选，默认 画布）"},
+                "root_title": {"type": "string", "description": "根主题标题（可选，默认 中心主题）"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path"],
+        ),
+        _tool(
+            "rename_sheet",
+            "重命名工作表。",
+            {
+                "file_path": file_path_prop,
+                "sheet_index": {"type": "integer", "description": "工作表索引"},
+                "title": {"type": "string", "description": "新标题"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path", "sheet_index", "title"],
+        ),
+        _tool(
+            "delete_sheet",
+            "删除工作表（至少保留一张）。",
+            {
+                "file_path": file_path_prop,
+                "sheet_index": {"type": "integer", "description": "要删除的工作表索引"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path", "sheet_index"],
+        ),
+        _tool(
+            "move_sheet",
+            "移动工作表顺序。",
+            {
+                "file_path": file_path_prop,
+                "sheet_index": {"type": "integer", "description": "当前索引"},
+                "new_index": {"type": "integer", "description": "目标索引"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path", "sheet_index", "new_index"],
+        ),
     ]
 
 
@@ -731,19 +1013,24 @@ class XMindTools:
         self.ocr.unload()
 
     async def call_tool(self, name: str, arguments: dict) -> list[types.TextContent]:
+        messages, _ = await self.call_tool_status(name, arguments)
+        return messages
+
+    async def call_tool_status(self, name: str, arguments: dict) -> tuple[list[types.TextContent], bool]:
+        """调用工具并返回 (消息, 是否错误)。错误信息同时让 MCP 标记 isError。"""
         handler = self._handlers.get(name)
         if handler is None:
-            return [types.TextContent(type="text", text=f"未知工具: {name}")]
+            return [types.TextContent(type="text", text=f"未知工具: {name}")], True
 
         try:
             result = await handler(self, arguments)
-            return [types.TextContent(type="text", text=result)]
+            return [types.TextContent(type="text", text=result)], False
         except FileNotFoundError as e:
-            return [types.TextContent(type="text", text=f"❌ 文件不存在或路径错误: {e}")]
+            return [types.TextContent(type="text", text=f"❌ 文件不存在或路径错误: {e}")], True
         except PermissionError as e:
-            return [types.TextContent(type="text", text=f"❌ 文件被占用或无权限访问: {e}")]
+            return [types.TextContent(type="text", text=f"❌ 文件被占用或无权限访问: {e}")], True
         except Exception as e:
-            return [types.TextContent(type="text", text=f"❌ 错误: {type(e).__name__}: {e}")]
+            return [types.TextContent(type="text", text=f"❌ 错误: {type(e).__name__}: {e}")], True
 
     # ---- 各工具实现 ----
 
@@ -797,7 +1084,10 @@ class XMindTools:
         include_style = args.get("include_style", False)
         max_depth = args.get("max_depth")
         max_nodes = args.get("max_nodes")
-        image_nodes = xm.find_topics_with_image()
+        # 只对会出现在输出里的图片节点做 OCR，
+        # 避免 max_depth/max_nodes 截断后仍全量识别
+        visible_ids = {n.id for n in _iter_visible_topics(xm, max_depth, max_nodes)}
+        image_nodes = [n for n in xm.find_topics_with_image() if n.id in visible_ids]
 
         # 先做所有图片的 OCR
         ocr_results: dict[str, str] = {}
@@ -807,7 +1097,11 @@ class XMindTools:
                     image_data = load_topic_image(node, xm)
                     if image_data:
                         result = await asyncio.to_thread(self.ocr.recognize, image_data)
-                        ocr_results[node.id] = result.text or "（未识别到文字）"
+                        ocr_results[node.id] = _truncate(
+                            result.text or "（未识别到文字）",
+                            MAX_OCR_CHARS,
+                            "OCR 结果过长已截断，可用 read_image_ocr 查看完整内容",
+                        )
                 except Exception as e:
                     ocr_results[node.id] = f"（OCR 失败: {type(e).__name__}: {e}）"
 
@@ -1029,14 +1323,44 @@ class XMindTools:
         file_path = args["file_path"]
         xm, writer = self.workspace.get(file_path)
         kwargs = {k: args.get(k) for k in (
-            "font_color", "font_size", "font_family", "font_weight",
-            "font_style", "background_color", "border_color", "border_width",
-            "shape", "line_color", "line_width", "text_align",
+            "importance", "font_color", "font_size", "font_family", "font_weight",
+            "font_style", "font_transform", "font_decoration",
+            "background_color", "fill_pattern", "border_color", "border_width", "border_pattern",
+            "shape", "line_color", "line_width", "line_pattern", "text_align",
         )}
         success = writer.set_node_style(args["node_id"], **kwargs)
         if not success:
             return f"❌ 找不到节点: {args['node_id']}"
         return self._auto_save_msg(file_path, writer, args, f"✅ 节点 {args['node_id']} 样式已更新。")
+
+    async def _set_branch_style(self, args: dict) -> str:
+        file_path = args["file_path"]
+        xm, writer = self.workspace.get(file_path)
+        kwargs = {k: args.get(k) for k in (
+            "line_type", "arrow_end", "line_color", "line_width", "line_pattern",
+        )}
+        success = writer.set_branch_style(args["node_id"], **kwargs)
+        if not success:
+            return f"❌ 找不到节点: {args['node_id']}"
+        return self._auto_save_msg(file_path, writer, args, f"✅ 节点 {args['node_id']} 的分支样式已更新。")
+
+    async def _set_theme_style(self, args: dict) -> str:
+        file_path = args["file_path"]
+        xm, writer = self.workspace.get(file_path)
+        kwargs = {k: args.get(k) for k in (
+            "font_color", "font_size", "font_family", "font_weight",
+            "font_style", "font_transform", "font_decoration",
+            "background_color", "fill_pattern", "border_color", "border_width", "border_pattern",
+            "shape", "line_color", "line_width", "line_pattern", "text_align",
+        )}
+        success = writer.set_theme_style(
+            sheet_index=args.get("sheet_index", 0),
+            level=args.get("level", "分支主题"),
+            **kwargs,
+        )
+        if not success:
+            return "❌ 工作表索引无效。"
+        return self._auto_save_msg(file_path, writer, args, f"✅ 主题层级「{args.get('level', '分支主题')}」的默认样式已更新。")
 
     async def _set_sheet_layout(self, args: dict) -> str:
         file_path = args["file_path"]
@@ -1135,6 +1459,16 @@ class XMindTools:
     async def _apply_style_preset(self, args: dict) -> str:
         file_path = args["file_path"]
         xm, writer = self.workspace.get(file_path)
+        if args.get("preview"):
+            nodes = xm.all_topics()
+            root_count = sum(1 for n in nodes if n.level == 0)
+            branch_count = sum(1 for n in nodes if n.level == 1)
+            leaf_count = len(nodes) - root_count - branch_count
+            return (
+                f"🔍 预览：预设「{args['preset']}」将影响全部 {len(nodes)} 个节点。\n"
+                f"  中心主题: {root_count}，分支主题: {branch_count}，其他: {leaf_count}\n"
+                "  未做任何修改，确认后请去掉 preview=true 再执行。"
+            )
         try:
             count = writer.apply_style_preset(args["preset"])
         except ValueError as e:
@@ -1327,6 +1661,9 @@ class XMindTools:
         file_path = args["file_path"]
         output_path = args.get("output_path")
         writer = XMindWriter.repair(file_path, output_path)
+        # 修复后让缓存重新从磁盘读取（覆盖原文件时 mtime 变化也会触发，
+        # 这里显式失效，避免旧对象残留）
+        self.workspace.invalidate(file_path)
         saved = str(output_path) if output_path else file_path
         node_count = len(writer.xm.all_topics())
         return f"✅ 已修复文件: {saved}\n节点总数: {node_count}"
@@ -1334,6 +1671,21 @@ class XMindTools:
     async def _apply_to_matching(self, args: dict) -> str:
         file_path = args["file_path"]
         xm, writer = self.workspace.get(file_path)
+        if args.get("preview"):
+            keyword = args["keyword"].lower()
+            matched = [
+                n for n in xm.all_topics()
+                if keyword in (n.title or "").lower()
+            ]
+            if not matched:
+                return f"❌ 没有找到标题包含 '{args['keyword']}' 的节点。"
+            lines = [f"🔍 预览：将修改 {len(matched)} 个节点："]
+            for n in matched[:50]:
+                lines.append(f"  • {n.id}  {_clean_title(n.title) or '（无标题）'}")
+            if len(matched) > 50:
+                lines.append(f"  …（其余 {len(matched) - 50} 个省略）")
+            lines.append("未做任何修改，确认后请去掉 preview=true 再执行。")
+            return "\n".join(lines)
         style = args.get("style") or None
         try:
             matched = writer.apply_matching(
@@ -1439,6 +1791,275 @@ class XMindTools:
             return f"{msg}\n✅ 已自动保存到: {saved_path}"
         return f"{msg}\n⚠️ 修改未保存，请调用 save_file 或设置 auto_save=true。"
 
+    async def _list_backups(self, args: dict) -> str:
+        backups = list_backups(args["file_path"])
+        if not backups:
+            return "该文件还没有自动备份。"
+        lines = [f"找到 {len(backups)} 份备份（新到旧）："]
+        for i, backup in enumerate(backups, 1):
+            lines.append(
+                f"{i}. {backup['name']}（{backup['mtime']}，{backup['size']} bytes）\n"
+                f"   路径: {backup['path']}"
+            )
+        return "\n".join(lines)
+
+    async def _restore_backup(self, args: dict) -> str:
+        file_path = args["file_path"]
+        try:
+            saved = restore_backup(file_path, args["backup_path"])
+        except (FileNotFoundError, PermissionError, OSError) as e:
+            return f"❌ 恢复失败: {type(e).__name__}: {e}"
+        self.workspace.invalidate(file_path)
+        return (
+            f"✅ 已从备份恢复: {saved}\n"
+            "⚠️ 恢复前的当前文件也已自动备份，可用 list_backups 找回。"
+        )
+
+    async def _export_svg(self, args: dict) -> str:
+        xm, _ = self.workspace.get(args["file_path"])
+        output = args.get("output_path") or str(Path(args["file_path"]).with_suffix(".svg"))
+        svg, stats = _build_svg(xm)
+        Path(output).write_text(svg, encoding="utf-8")
+        return (
+            f"✅ 已导出 SVG 示意图: {output}\n"
+            f"工作表: {stats['sheets']}，节点: {stats['nodes']}\n"
+            "说明: SVG 是给人工查看的示意图；模型请用 analyze_style 获取结构化样式反馈。"
+        )
+
+    async def _analyze_style(self, args: dict) -> str:
+        from collections import Counter
+
+        xm, _ = self.workspace.get(args["file_path"])
+        sheet_index = args.get("sheet_index", 0)
+        if sheet_index < 0 or sheet_index >= len(xm.sheets):
+            return "❌ 工作表索引无效。"
+        sheet_raw = xm.raw_content[sheet_index]
+        theme = sheet_raw.get("theme") if isinstance(sheet_raw, dict) else None
+        lines = [f"🎨 工作表「{sheet_raw.get('title', '')}」样式审计"]
+
+        if isinstance(theme, dict):
+            lines.append("")
+            lines.append("主题层级默认样式：")
+            label_map = {value: key for key, value in THEME_LEVELS.items()}
+            for key, label in label_map.items():
+                entry = theme.get(key)
+                if isinstance(entry, dict):
+                    props = entry.get("properties")
+                    if isinstance(props, dict) and props:
+                        prop_text = ", ".join(f"{k}={v}" for k, v in props.items())
+                        lines.append(f"  • {label}: {prop_text}")
+
+        nodes = [n for n in xm.all_topics() if n.sheet_index == sheet_index]
+        fills: Counter = Counter()
+        colors: Counter = Counter()
+        fonts: Counter = Counter()
+        shapes: Counter = Counter()
+        branch_lines: Counter = Counter()
+        node_style_count = 0
+        for n in nodes:
+            eff = _effective_style(n, xm)
+            if eff.get("svg:fill"):
+                fills[eff["svg:fill"]] += 1
+            if eff.get("fo:color"):
+                colors[eff["fo:color"]] += 1
+            if eff.get("fo:font-family"):
+                fonts[eff["fo:font-family"]] += 1
+            if eff.get("shape-class"):
+                shapes[eff["shape-class"]] += 1
+            if eff.get("line-class"):
+                branch_lines[eff["line-class"]] += 1
+            if (n.style or {}).get("properties"):
+                node_style_count += 1
+
+        def _counter_text(title: str, counter: Counter) -> str:
+            if not counter:
+                return f"{title}: 无"
+            items = ", ".join(f"{k}×{v}" for k, v in counter.most_common(10))
+            return f"{title}: {items}"
+
+        lines.append("")
+        lines.append(f"节点总数: {len(nodes)}，带节点级样式: {node_style_count}")
+        lines.append(_counter_text("背景色", fills))
+        lines.append(_counter_text("文字色", colors))
+        lines.append(_counter_text("字体", fonts))
+        lines.append(_counter_text("形状", shapes))
+        lines.append(_counter_text("分支线型", branch_lines))
+
+        if args.get("include_node_styles"):
+            max_nodes = min(int(args.get("max_nodes", 50) or 50), 200)
+            lines.append("")
+            lines.append(f"节点有效样式（前 {min(max_nodes, len(nodes))} 个）：")
+            for n in nodes[:max_nodes]:
+                eff = _effective_style(n, xm)
+                if eff:
+                    title = _clean_title(n.title) or "（无标题）"
+                    lines.append(
+                        f"  • {n.id} {title}: {json.dumps(eff, ensure_ascii=False)}"
+                    )
+        return "\n".join(lines)
+
+    async def _list_attachments(self, args: dict) -> str:
+        xm, _ = self.workspace.get(args["file_path"])
+        referenced = {
+            n.image_src[4:]
+            for n in xm.all_topics()
+            if n.image_src and n.image_src.startswith("xap:")
+        }
+        entries: list[str] = []
+        try:
+            with zipfile.ZipFile(io.BytesIO(xm._zip_bytes)) as zf:
+                entries = [name for name in zf.namelist() if not name.endswith("/")]
+        except zipfile.BadZipFile:
+            return "❌ 文件不是有效的 xmind 包。"
+        attachments = [name for name in entries if name.startswith(("attachments/", "resources/"))]
+        used = [name for name in attachments if name in referenced]
+        unused = [name for name in attachments if name not in referenced]
+        lines = [f"附件/资源共 {len(attachments)} 个："]
+        lines.append(f"被引用 ({len(used)})：")
+        lines.extend(f"  • {name}" for name in used[:50])
+        if len(used) > 50:
+            lines.append(f"  …（其余 {len(used) - 50} 个）")
+        lines.append(f"未被引用 ({len(unused)})：")
+        lines.extend(f"  • {name}" for name in unused[:50])
+        if len(unused) > 50:
+            lines.append(f"  …（其余 {len(unused) - 50} 个）")
+        return "\n".join(lines)
+
+    async def _remove_unused_attachments(self, args: dict) -> str:
+        file_path = args["file_path"]
+        _, writer = self.workspace.get(file_path)
+        unused = writer.remove_unused_attachments()
+        if not unused:
+            return "没有发现未引用的附件/图片资源。"
+        msg = (
+            f"标记移除 {len(unused)} 个未引用资源：\n"
+            + "\n".join(f"  • {name}" for name in unused[:50])
+            + ("\n  …" if len(unused) > 50 else "")
+            + "\n保存后生效。"
+        )
+        return self._auto_save_msg(file_path, writer, args, msg)
+
+    async def _batch_update_titles(self, args: dict) -> str:
+        file_path = args["file_path"]
+        _, writer = self.workspace.get(file_path)
+        try:
+            changes = writer.batch_update_titles(
+                args["find"],
+                args["replace"],
+                use_regex=args.get("use_regex", False),
+            )
+        except ValueError as e:
+            return f"❌ {e}"
+        if not changes:
+            return "没有标题包含匹配内容。"
+        lines = [f"已修改 {len(changes)} 个标题："]
+        for tid, old, new in changes[:50]:
+            lines.append(f"  • {tid}: {old!r} → {new!r}")
+        if len(changes) > 50:
+            lines.append(f"  …（其余 {len(changes) - 50} 个省略）")
+        return self._auto_save_msg(file_path, writer, args, "\n".join(lines))
+
+    async def _delete_empty_nodes(self, args: dict) -> str:
+        file_path = args["file_path"]
+        _, writer = self.workspace.get(file_path)
+        deleted = writer.delete_empty_nodes()
+        if not deleted:
+            return "没有发现空标题节点。"
+        msg = f"已删除 {len(deleted)} 个空标题节点（含其子树）。"
+        return self._auto_save_msg(file_path, writer, args, msg)
+
+    async def _merge_duplicate_nodes(self, args: dict) -> str:
+        file_path = args["file_path"]
+        _, writer = self.workspace.get(file_path)
+        merged = writer.merge_duplicate_nodes()
+        if not merged:
+            return "没有发现重复标题的兄弟节点。"
+        lines = [f"已合并 {len(merged)} 组重复节点："]
+        for kept_id, removed_id in merged[:50]:
+            lines.append(f"  • {removed_id} → 并入 {kept_id}")
+        if len(merged) > 50:
+            lines.append(f"  …（其余 {len(merged) - 50} 组省略）")
+        return self._auto_save_msg(file_path, writer, args, "\n".join(lines))
+
+    async def _notes_to_children(self, args: dict) -> str:
+        file_path = args["file_path"]
+        _, writer = self.workspace.get(file_path)
+        try:
+            count = writer.notes_to_children(
+                args["node_id"],
+                keep_notes=args.get("keep_notes", False),
+            )
+        except ValueError as e:
+            return f"❌ {e}"
+        msg = f"已将备注的 {count} 行转换为子节点。"
+        return self._auto_save_msg(file_path, writer, args, msg)
+
+    async def _children_to_notes(self, args: dict) -> str:
+        file_path = args["file_path"]
+        _, writer = self.workspace.get(file_path)
+        try:
+            count = writer.children_to_notes(
+                args["node_id"],
+                keep_children=args.get("keep_children", False),
+            )
+        except ValueError as e:
+            return f"❌ {e}"
+        msg = f"已将 {count} 个子节点标题合并到备注。"
+        return self._auto_save_msg(file_path, writer, args, msg)
+
+    async def _auto_number(self, args: dict) -> str:
+        file_path = args["file_path"]
+        _, writer = self.workspace.get(file_path)
+        try:
+            count = writer.auto_number(mode=args.get("mode", "decimal"))
+        except ValueError as e:
+            return f"❌ {e}"
+        msg = f"已为 {count} 个节点编号。"
+        return self._auto_save_msg(file_path, writer, args, msg)
+
+    async def _list_sheets(self, args: dict) -> str:
+        xm, _ = self.workspace.get(args["file_path"])
+        lines = [f"共 {len(xm.sheets)} 张工作表："]
+        for i, sheet in enumerate(xm.sheets):
+            node_count = sum(1 for n in xm.all_topics() if n.sheet_index == i)
+            root_title = _clean_title(sheet.root.title) or "（无标题）"
+            lines.append(f"  {i}. {sheet.title}（根主题: {root_title}，节点: {node_count}）")
+        return "\n".join(lines)
+
+    async def _add_sheet(self, args: dict) -> str:
+        file_path = args["file_path"]
+        _, writer = self.workspace.get(file_path)
+        index = writer.add_sheet(
+            title=args.get("title", "画布"),
+            root_title=args.get("root_title", "中心主题"),
+        )
+        msg = f"✅ 已新增工作表（索引 {index}）。"
+        return self._auto_save_msg(file_path, writer, args, msg)
+
+    async def _rename_sheet(self, args: dict) -> str:
+        file_path = args["file_path"]
+        _, writer = self.workspace.get(file_path)
+        if not writer.rename_sheet(args["sheet_index"], args["title"]):
+            return "❌ 工作表索引无效。"
+        msg = f"✅ 工作表 {args['sheet_index']} 已重命名为「{args['title']}」。"
+        return self._auto_save_msg(file_path, writer, args, msg)
+
+    async def _delete_sheet(self, args: dict) -> str:
+        file_path = args["file_path"]
+        _, writer = self.workspace.get(file_path)
+        if not writer.delete_sheet(args["sheet_index"]):
+            return "❌ 删除失败：索引无效或文件只剩一张工作表。"
+        msg = f"✅ 已删除工作表 {args['sheet_index']}。"
+        return self._auto_save_msg(file_path, writer, args, msg)
+
+    async def _move_sheet(self, args: dict) -> str:
+        file_path = args["file_path"]
+        _, writer = self.workspace.get(file_path)
+        if not writer.move_sheet(args["sheet_index"], args["new_index"]):
+            return "❌ 移动失败：索引无效。"
+        msg = f"✅ 工作表已从 {args['sheet_index']} 移动到 {args['new_index']}。"
+        return self._auto_save_msg(file_path, writer, args, msg)
+
     async def _get_hardware_info(self, args: dict) -> str:
         c = self.config
         ok, msg = verify_installed(c.ocr_engine, c.device)
@@ -1473,6 +2094,8 @@ class XMindTools:
         "export_markdown": _export_markdown,
         "export_text": _export_text,
         "set_node_style": _set_node_style,
+        "set_branch_style": _set_branch_style,
+        "set_theme_style": _set_theme_style,
         "set_sheet_layout": _set_sheet_layout,
         "apply_style_preset": _apply_style_preset,
         "add_image": _add_image,
@@ -1496,6 +2119,23 @@ class XMindTools:
         "apply_to_matching": _apply_to_matching,
         "analyze_file": _analyze_file,
         "get_hardware_info": _get_hardware_info,
+        "list_backups": _list_backups,
+        "restore_backup": _restore_backup,
+        "export_svg": _export_svg,
+        "analyze_style": _analyze_style,
+        "list_attachments": _list_attachments,
+        "remove_unused_attachments": _remove_unused_attachments,
+        "batch_update_titles": _batch_update_titles,
+        "delete_empty_nodes": _delete_empty_nodes,
+        "merge_duplicate_nodes": _merge_duplicate_nodes,
+        "notes_to_children": _notes_to_children,
+        "children_to_notes": _children_to_notes,
+        "auto_number": _auto_number,
+        "list_sheets": _list_sheets,
+        "add_sheet": _add_sheet,
+        "rename_sheet": _rename_sheet,
+        "delete_sheet": _delete_sheet,
+        "move_sheet": _move_sheet,
     }
 
 
@@ -1515,6 +2155,11 @@ def _parse_markdown_outline(markdown: str) -> tuple[str, list[dict]]:
     这是“原封不动”模式：除了去掉标题/列表/引用/围栏代码的标记符号外，
     所有文字（表格行、代码块内容、行内格式）都会保留，不做概括或精简。
     纯分隔线（--- / *** / ___）不产生节点。
+
+    层级规则：
+    - 文档只有一个顶层条目（通常是唯一的 # 标题）时，它作为中心主题；
+    - 有多个顶层条目（平铺列表、多个 # 标题）时，自动加一个“未命名”
+      中心主题，所有顶层条目作为它的分支，避免把兄弟条目错挂成父子。
     """
     items: list[tuple[int, str]] = []
     in_fence = False
@@ -1551,15 +2196,14 @@ def _parse_markdown_outline(markdown: str) -> tuple[str, list[dict]]:
     if not items:
         raise ValueError("Markdown 内容为空，无法创建文件")
 
-    # 整体归一化：最小层级变成 1，保证第一项是根
+    # 整体归一化：最小层级变成 1
     min_level = min(level for level, _ in items)
     normalized = [(max(level - min_level + 1, 1), text) for level, text in items]
 
-    # 第一项作为根主题，其余按层级挂到树上
-    root_level, root_title = normalized[0]
-    root: dict = {"title": root_title, "children": []}
-    stack: list[tuple[int, dict]] = [(root_level, root)]
-    for level, text in normalized[1:]:
+    # 先挂到虚拟根上：标准大纲算法，层级跳变时自动成为上层节点的子节点
+    virtual: dict = {"title": "", "children": []}
+    stack: list[tuple[int, dict]] = [(0, virtual)]
+    for level, text in normalized:
         while len(stack) > 1 and level <= stack[-1][0]:
             stack.pop()
         parent = stack[-1][1]
@@ -1567,4 +2211,127 @@ def _parse_markdown_outline(markdown: str) -> tuple[str, list[dict]]:
         parent["children"].append(child)
         stack.append((level, child))
 
-    return root_title, root["children"]
+    top_level = virtual["children"]
+    if len(top_level) == 1:
+        # 只有一个顶层条目（典型：# 根主题 + 各层子节点），它就是中心主题
+        real_root = top_level[0]
+        return real_root["title"], real_root["children"]
+    # 多个顶层条目（平铺列表 / 多个 # 标题）→ 自动加“未命名”中心主题，
+    # 所有顶层条目保持兄弟关系，不被错误嵌套
+    return "未命名", top_level
+
+
+def _build_svg(xm: XMindFile) -> tuple[str, dict]:
+    """把节点树画成一张示意图 SVG（给人工预览用，不是 XMind 的像素级渲染）。
+
+    布局：根在左侧，子节点逐层向右展开；方块颜色尽量贴近节点的有效样式。
+    """
+    MARGIN = 40
+    BOX_H = 34
+    GAP = 12
+    LEVEL_W = 240
+
+    def _esc(text: str) -> str:
+        return (
+            str(text)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    def _height(node: TopicNode) -> int:
+        if not node.children:
+            return 1
+        return sum(_height(child) for child in node.children)
+
+    def _box_width(title: str) -> int:
+        return min(320, max(110, 28 + len(title) * 15))
+
+    def _fill(node: TopicNode) -> str:
+        color = _effective_style(node, xm).get("svg:fill") or "#FFFFFF"
+        return color[:7]
+
+    def _stroke(node: TopicNode) -> str:
+        color = _effective_style(node, xm).get("border-line-color") or "#CCCCCC"
+        return color[:7]
+
+    def _text_color(node: TopicNode) -> str:
+        color = _effective_style(node, xm).get("fo:color") or "#333333"
+        return color[:7]
+
+    def _font_size(node: TopicNode) -> int:
+        value = _effective_style(node, xm).get("fo:font-size") or "14pt"
+        digits = "".join(ch for ch in str(value) if ch.isdigit())
+        try:
+            return min(max(int(digits), 8), 24)
+        except ValueError:
+            return 14
+
+    elements: list[str] = []
+    node_count = 0
+    max_x = MARGIN
+    y_cursor = MARGIN
+
+    for sheet in xm.sheets:
+        sheet_height = _height(sheet.root) * (BOX_H + GAP) - GAP
+        elements.append(
+            f'<text x="{MARGIN}" y="{y_cursor - 10}" font-size="16" font-weight="bold" '
+            f'fill="#444444">{_esc(sheet.title)}</text>'
+        )
+        start_y = y_cursor
+
+        def _place(node: TopicNode, x: int, y_top: int) -> None:
+            nonlocal node_count, max_x
+            node_count += 1
+            block = _height(node) * (BOX_H + GAP) - GAP
+            title = _clean_title(node.title) or ("📷图片" if node.image_src else "（无标题）")
+            width = _box_width(title)
+            y = y_top + (block - BOX_H) / 2
+            shape_class = _effective_style(node, xm).get("shape-class") or ""
+            rx = 24 if ("circle" in shape_class or "ellipse" in shape_class) else 6
+            tooltip = ""
+            if node.notes:
+                tooltip = f"<title>{_esc(_truncate(node.notes, 300))}</title>"
+
+            elements.append(
+                f'<rect x="{x:.0f}" y="{y:.0f}" width="{width}" height="{BOX_H}" rx="{rx}" '
+                f'fill="{_fill(node)}" stroke="{_stroke(node)}" stroke-width="1.5">{tooltip}</rect>'
+            )
+            max_chars = max(1, (width - 20) // 15)
+            shown = title if len(title) <= max_chars else title[: max_chars - 1] + "…"
+            font_px = _font_size(node)
+            elements.append(
+                f'<text x="{x + width / 2:.0f}" y="{y + BOX_H / 2 + font_px * 0.35:.0f}" '
+                f'font-size="{font_px}" text-anchor="middle" fill="{_text_color(node)}">'
+                f"{_esc(shown)}</text>"
+            )
+            max_x = max(max_x, x + width)
+
+            child_x = x + width + 60
+            child_y_top = y_top
+            for child in node.children:
+                child_block = _height(child) * (BOX_H + GAP) - GAP
+                child_y = child_y_top + (child_block - BOX_H) / 2
+                elements.append(
+                    f'<line x1="{x + width:.0f}" y1="{y + BOX_H / 2:.0f}" '
+                    f'x2="{child_x:.0f}" y2="{child_y + BOX_H / 2:.0f}" '
+                    'stroke="#AAAAAA" stroke-width="1.5"/>'
+                )
+                _place(child, child_x, child_y_top)
+                child_y_top += child_block + GAP
+
+        _place(sheet.root, MARGIN, start_y)
+        y_cursor = start_y + sheet_height + 60
+
+    canvas_w = int(max_x + MARGIN)
+    canvas_h = int(y_cursor)
+    svg = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{canvas_w}" height="{canvas_h}" '
+        f'viewBox="0 0 {canvas_w} {canvas_h}">\n'
+        f'<rect width="100%" height="100%" fill="#FAFAFA"/>\n'
+        + "\n".join(elements)
+        + "\n</svg>\n"
+    )
+    return svg, {"sheets": len(xm.sheets), "nodes": node_count}

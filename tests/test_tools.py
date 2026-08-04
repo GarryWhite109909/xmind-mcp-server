@@ -429,6 +429,68 @@ async def test_apply_to_matching_tool(config: Config, sample_xmind: Path):
     assert "#FF0000" in read[0].text
 
 
+async def test_set_node_style_tool_chinese(config: Config, sample_xmind: Path):
+    tools = XMindTools(config)
+    result = await tools.call_tool("set_node_style", {
+        "file_path": str(sample_xmind),
+        "node_id": "child-1",
+        "importance": "极其重要",
+        "shape": "菱形",
+        "border_width": "极粗",
+        "font_transform": "全大写",
+        "font_decoration": "删除线",
+        "background_color": "4E0D58 40%",
+        "auto_save": True,
+    })
+    assert "样式已更新" in result[0].text
+
+    xm, _ = tools.workspace.get(str(sample_xmind))
+    raw = xm.find_topic("child-1")._raw
+    assert raw["class"] == "importantTopic"
+    props = raw["style"]["properties"]
+    assert props["shape-class"] == "org.xmind.topicShape.diamond"
+    assert props["border-line-width"] == "8pt"
+    assert props["fo:text-transform"] == "uppercase"
+    assert props["fo:text-decoration"] == "line-through"
+    assert props["svg:fill"] == "#4E0D5866"
+
+
+async def test_set_branch_style_tool(config: Config, sample_xmind: Path):
+    tools = XMindTools(config)
+    result = await tools.call_tool("set_branch_style", {
+        "file_path": str(sample_xmind),
+        "node_id": "child-1",
+        "line_type": "圆弧",
+        "arrow_end": "圆点",
+        "line_width": "细",
+    })
+    assert "分支样式已更新" in result[0].text
+
+    xm, _ = tools.workspace.get(str(sample_xmind))
+    props = xm.find_topic("child-1").style["properties"]
+    assert props["line-class"] == "org.xmind.branchConnection.bight"
+    assert props["arrow-end-class"] == "org.xmind.arrowShape.dot"
+    assert props["line-width"] == "2pt"
+
+
+async def test_set_theme_style_tool(config: Config, sample_xmind: Path):
+    tools = XMindTools(config)
+    result = await tools.call_tool("set_theme_style", {
+        "file_path": str(sample_xmind),
+        "level": "中心主题",
+        "font_size": 30,
+        "shape": "圆形",
+        "background_color": "#000000",
+    })
+    assert "默认样式已更新" in result[0].text
+
+    xm, _ = tools.workspace.get(str(sample_xmind))
+    props = xm.raw_content[0]["theme"]["centralTopic"]["properties"]
+    assert props["fo:font-size"] == "30pt"
+    assert props["shape-class"] == "org.xmind.topicShape.circle"
+    assert props["svg:fill"] == "#000000"
+
+
 async def test_analyze_file_tool(config: Config, sample_xmind: Path):
     tools = XMindTools(config)
     result = await tools.call_tool("analyze_file", {"file_path": str(sample_xmind)})
