@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xmind-mcp-server"
-version = "0.2.1"
+version = "0.2.2"
 description = "让大模型读写 XMind 文件，支持图片 OCR 的 MCP Server"
 readme = "README.md"
 license = {text = "MIT"}
@@ -59,6 +59,9 @@ Issues = "https://github.com/GarryWhite109909/xmind-mcp-server/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+xmind_mcp = ["default_theme.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -201,6 +201,7 @@ xmind-mcp
 | `save_file` | 保存修改，可覆盖或另存为 |
 | `create_file` | 从零新建 XMind 文件（支持嵌套 JSON 结构） |
 | `import_markdown` | 把 Markdown 大纲转成新的 XMind 文件 |
+| `repair_file` | 修复打不开的 XMind 文件（自动补全必需组成部分，覆盖前自动备份） |
 | `apply_to_matching` | 按标题关键词批量设置样式、标记、标签 |
 
 ### 美化 / 标记类（让笔记更美观易读）

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import copy
 import io
 import hashlib
 import json
@@ -21,8 +22,9 @@ import zipfile
 from pathlib import Path
 from typing import Optional, Union
 
+from . import __version__
 from .config import BACKUP_DIR
-from .xmind_parser import XMindFile, TopicNode, topic_ids_in_subtree
+from .xmind_parser import XMindFile, TopicNode, parse_xmind, topic_ids_in_subtree
 
 
 STYLE_PRESETS: dict[str, dict[str, dict[str, str]]] = {
@@ -42,6 +44,84 @@ STYLE_PRESETS: dict[str, dict[str, dict[str, str]]] = {
         "leaf": {"background_color": "#F5FAF7", "font_color": "#333333"},
     },
 }
+
+# XMind 打开文件时的必需元数据。缺失 metadata.json 时 XMind 会直接报错拒绝打开。
+DEFAULT_METADATA: dict = {
+    "dataStructureVersion": "3",
+    "layoutEngineVersion": "5",
+    "creator": {"name": "xmind-mcp", "version": __version__},
+}
+
+# 内置默认主题（与 XMind 26 实际保存的默认主题结构一致），缓存避免重复读盘。
+_DEFAULT_THEME: Optional[dict] = None
+
+
+def _load_default_theme() -> dict:
+    """读取内置默认主题。"""
+    global _DEFAULT_THEME
+    if _DEFAULT_THEME is None:
+        theme_path = Path(__file__).with_name("default_theme.json")
+        _DEFAULT_THEME = json.loads(theme_path.read_text(encoding="utf-8"))
+    return _DEFAULT_THEME
+
+
+def _new_theme() -> dict:
+    """返回一份带全新 id 的默认主题副本（每个 sheet 独立，避免同文件内 id 冲突）。"""
+    theme = copy.deepcopy(_load_default_theme())
+    for value in theme.values():
+        if isinstance(value, dict) and isinstance(value.get("id"), str):
+            value["id"] = str(uuid.uuid4())
+    return theme
+
+
+def _xml_text(value: str) -> str:
+    """转义 XML 文本中的特殊字符。"""
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _xml_attr(value: str) -> str:
+    """转义 XML 属性值。"""
+    return _xml_text(value).replace('"', "&quot;")
+
+
+def _content_xml_stub(raw_content: list[dict]) -> str:
+    """生成新版文件附带的最小 content.xml 占位（兼容旧版读取器；XMind 26 以 content.json 为准）。"""
+    sheet = raw_content[0] if raw_content else {}
+    if not isinstance(sheet, dict):
+        sheet = {}
+    root = sheet.get("rootTopic", {})
+    if not isinstance(root, dict):
+        root = {}
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="no"?>'
+        '<xmap-content xmlns="urn:xmind:xmap:xmlns:content:2.0" '
+        'xmlns:fo="http://www.w3.org/1999/XSL/Format" '
+        'xmlns:svg="http://www.w3.org/2000/svg" '
+        'xmlns:xhtml="http://www.w3.org/1999/xhtml" '
+        'xmlns:xlink="http://www.w3.org/1999/xlink" version="2.0">'
+        f'<sheet id="{_xml_attr(sheet.get("id", ""))}">'
+        f'<topic id="{_xml_attr(root.get("id", ""))}">'
+        f"<title>{_xml_text(root.get('title', ''))}</title>"
+        "</topic></sheet></xmap-content>"
+    )
+
+
+def _ensure_topic_class(topic: dict) -> None:
+    """给缺失 class 的普通主题补上 "topic"（保留 importantTopic 等特殊类型；
+    概要/批注节点靠 children 位置区分，不强加 class，避免显示异常）。"""
+    if not isinstance(topic, dict):
+        return
+    topic.setdefault("class", "topic")
+    children = topic.get("children", {})
+    if isinstance(children, dict):
+        for key in ("attached", "detached"):
+            for child in children.get(key, []):
+                _ensure_topic_class(child)
 
 
 def _backup_file(path: str) -> Optional[str]:
@@ -821,6 +901,10 @@ class XMindWriter:
     def save(self, output_path: Optional[Union[str, Path]] = None) -> str:
         """保存文件。output_path 为 None 时覆盖原文件。
 
+        保存时会自动补全 XMind 打开文件所必需的组成部分
+        （metadata.json、content.xml、cache.json，并更新 manifest.json），
+        因此旧版本生成的残缺文件在下次保存时也能被修复。
+
         Returns:
             实际保存的路径
         """
@@ -837,45 +921,54 @@ class XMindWriter:
         # 序列化修改后的 content.json
         new_content = json.dumps(self.xm.raw_content, ensure_ascii=False, indent=2)
 
-        # 读取原始 zip，复制所有文件，替换 content.json
+        # 读取原始 zip，复制所有文件，替换 content.json，并补全必需文件
         source_zip = io.BytesIO(self.xm._zip_bytes)
         with zipfile.ZipFile(source_zip, "r") as zin:
             with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zout:
-                manifest_written = False
+                written: set[str] = set()
+                manifest: dict = {}
                 for item in zin.infolist():
                     if item.filename == "content.json":
                         zout.writestr("content.json", new_content)
+                        written.add("content.json")
                     elif item.filename == "manifest.json":
-                        manifest_written = True
                         try:
                             manifest = json.loads(zin.read(item.filename))
                         except (json.JSONDecodeError, KeyError):
                             manifest = {}
-                        entries = manifest.setdefault("file-entries", {})
-                        for name in self._extra_files:
-                            entries.setdefault(name, {})
-                        zout.writestr(
-                            "manifest.json",
-                            json.dumps(manifest, ensure_ascii=False, indent=2),
-                        )
                     else:
                         zout.writestr(item, zin.read(item.filename))
+                        written.add(item.filename)
+
+                # 补全 XMind 必需文件（已存在的原样保留，例如 XMind 自己写的 content.xml）
+                required = (
+                    (
+                        "metadata.json",
+                        json.dumps(DEFAULT_METADATA, ensure_ascii=False, indent=2),
+                    ),
+                    ("cache.json", "{}"),
+                    ("content.xml", _content_xml_stub(self.xm.raw_content)),
+                )
+                for name, data in required:
+                    if name not in written:
+                        zout.writestr(name, data)
+                        written.add(name)
+
                 # 新增资源（如插入的图片）
                 for name, data in self._extra_files.items():
-                    if name not in zout.namelist():
+                    if name not in written:
                         zout.writestr(name, data)
-                if self._extra_files and not manifest_written:
-                    # 原文件没有 manifest 时补一个，登记新增资源
-                    manifest = {
-                        "file-entries": {
-                            "content.json": {},
-                            **{name: {} for name in self._extra_files},
-                        }
-                    }
-                    zout.writestr(
-                        "manifest.json",
-                        json.dumps(manifest, ensure_ascii=False, indent=2),
-                    )
+                        written.add(name)
+
+                # manifest 登记所有文件（目录项不登记）
+                entries = manifest.setdefault("file-entries", {})
+                for name in written:
+                    if name != "manifest.json" and not name.endswith("/"):
+                        entries.setdefault(name, {})
+                zout.writestr(
+                    "manifest.json",
+                    json.dumps(manifest, ensure_ascii=False, indent=2),
+                )
 
         # 更新内部缓存
         with open(output_path, "rb") as f:
@@ -959,6 +1052,10 @@ class XMindWriter:
         """从零创建一个新的 XMind 文件。
 
         topics 为嵌套结构：[{"title": "...", "notes": "...", "children": [...]}]
+
+        新文件会包含 XMind 打开所必需的全部组成部分：
+        content.json / metadata.json / content.xml / cache.json / manifest.json，
+        并带上默认主题、revisionId 等字段，确保 XMind 能正常打开。
         """
         output_path = str(output_path)
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -968,6 +1065,7 @@ class XMindWriter:
                 "id": str(uuid.uuid4()),
                 "title": item.get("title", ""),
                 "class": "topic",
+                "titleUnedited": True,
                 "children": {"attached": [], "detached": []},
             }
             notes = item.get("notes")
@@ -977,20 +1075,36 @@ class XMindWriter:
             topic["children"]["attached"] = [_build_topic(c) for c in children]
             return topic
 
+        root_id = str(uuid.uuid4())
         root = {
-            "id": str(uuid.uuid4()),
+            "id": root_id,
             "title": root_title,
             "class": "topic",
+            "titleUnedited": True,
+            "structureClass": "org.xmind.ui.map.clockwise",
             "children": {
                 "attached": [_build_topic(t) for t in (topics or [])],
                 "detached": [],
             },
         }
+        sheet_id = str(uuid.uuid4())
         sheet = {
-            "id": str(uuid.uuid4()),
+            "id": sheet_id,
+            "revisionId": str(uuid.uuid4()),
             "class": "sheet",
             "title": sheet_title,
             "rootTopic": root,
+            "relationships": [],
+            "topicOverlapping": "overlap",
+            "arrangeableLayerOrder": [root_id],
+            "zones": [],
+            "extensions": [
+                {
+                    "provider": "org.xmind.ui.skeleton.structure.style",
+                    "content": {"centralTopic": "org.xmind.ui.map.clockwise"},
+                }
+            ],
+            "theme": _new_theme(),
         }
         content = [sheet]
 
@@ -1001,8 +1115,25 @@ class XMindWriter:
                 json.dumps(content, ensure_ascii=False, indent=2),
             )
             zf.writestr(
+                "metadata.json",
+                json.dumps(DEFAULT_METADATA, ensure_ascii=False, indent=2),
+            )
+            zf.writestr("cache.json", "{}")
+            zf.writestr("content.xml", _content_xml_stub(content))
+            zf.writestr(
                 "manifest.json",
-                json.dumps({"file-entries": {"content.json": {}}}, indent=2),
+                json.dumps(
+                    {
+                        "file-entries": {
+                            "content.json": {},
+                            "metadata.json": {},
+                            "cache.json": {},
+                            "content.xml": {},
+                        }
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
             )
         with open(output_path, "wb") as f:
             f.write(zip_bytes.getvalue())
@@ -1011,8 +1142,40 @@ class XMindWriter:
             path=output_path,
             sheets=[],
             raw_content=content,
-            zip_namelist=["content.json", "manifest.json"],
+            zip_namelist=[
+                "content.json",
+                "metadata.json",
+                "cache.json",
+                "content.xml",
+                "manifest.json",
+            ],
             _zip_bytes=zip_bytes.getvalue(),
         )
         xm.refresh_from_raw()
         return cls(xm)
+
+    @classmethod
+    def repair(
+        cls,
+        input_path: Union[str, Path],
+        output_path: Optional[Union[str, Path]] = None,
+    ) -> "XMindWriter":
+        """修复打不开的 XMind 文件：补全 metadata.json / content.xml / theme / revisionId。
+
+        不改变主题内容；output_path 为 None 时原地覆盖（保存前会自动备份原文件）。
+        """
+        xm = parse_xmind(input_path)
+        for sheet in xm.raw_content:
+            if not isinstance(sheet, dict):
+                continue
+            sheet.setdefault("revisionId", str(uuid.uuid4()))
+            sheet.setdefault("theme", _new_theme())
+            root = sheet.get("rootTopic")
+            if isinstance(root, dict):
+                root.setdefault("titleUnedited", True)
+                root.setdefault("structureClass", "org.xmind.ui.map.clockwise")
+                _ensure_topic_class(root)
+        writer = cls(xm)
+        target = str(output_path) if output_path is not None else xm.path
+        writer.save(target)
+        return writer

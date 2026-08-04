@@ -20,6 +20,7 @@
     save_file         — 保存修改
     create_file       — 从零新建 XMind 文件
     import_markdown   — 从 Markdown 大纲新建 XMind 文件
+    repair_file       — 修复打不开的 XMind 文件（补全必需组成部分）
     apply_to_matching — 按关键词批量设置样式/标记/标签
 
   美化类:
@@ -404,6 +405,15 @@ def build_tool_list() -> list[types.Tool]:
             {
                 "file_path": {"type": "string", "description": "当前 .xmind 文件路径"},
                 "output_path": {"type": "string", "description": "另存为的路径（可选，省略则覆盖原文件）"},
+            },
+            ["file_path"],
+        ),
+        _tool(
+            "repair_file",
+            "修复打不开的 XMind 文件：自动补全 metadata.json、content.xml、默认主题、revisionId 等 XMind 必需内容，不改变已有主题和样式。覆盖保存前会自动备份原文件。",
+            {
+                "file_path": file_path_prop,
+                "output_path": {"type": "string", "description": "修复后另存的路径（可选，省略则覆盖原文件）"},
             },
             ["file_path"],
         ),
@@ -1266,6 +1276,14 @@ class XMindTools:
         node_count = len(xm.all_topics())
         return f"✅ 已从 Markdown 创建文件: {file_path}\n根主题: {root_title}\n节点总数: {node_count}"
 
+    async def _repair_file(self, args: dict) -> str:
+        file_path = args["file_path"]
+        output_path = args.get("output_path")
+        writer = XMindWriter.repair(file_path, output_path)
+        saved = str(output_path) if output_path else file_path
+        node_count = len(writer.xm.all_topics())
+        return f"✅ 已修复文件: {saved}\n节点总数: {node_count}"
+
     async def _apply_to_matching(self, args: dict) -> str:
         file_path = args["file_path"]
         xm, writer = self.workspace.get(file_path)
@@ -1426,6 +1444,7 @@ class XMindTools:
         "get_node": _get_node,
         "create_file": _create_file,
         "import_markdown": _import_markdown,
+        "repair_file": _repair_file,
         "apply_to_matching": _apply_to_matching,
         "analyze_file": _analyze_file,
         "get_hardware_info": _get_hardware_info,

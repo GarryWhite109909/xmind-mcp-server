@@ -283,6 +283,36 @@ async def test_import_markdown_tool(config: Config, tmp_path: Path):
     assert "分支B" in text
 
 
+async def test_repair_file_tool(config: Config, tmp_path: Path):
+    """repair_file 能把缺 metadata.json 的文件补全并恢复读取。"""
+    import json
+    import zipfile
+
+    broken = tmp_path / "broken.xmind"
+    with zipfile.ZipFile(broken, "w") as zf:
+        zf.writestr("content.json", json.dumps([{
+            "id": "s1",
+            "title": "旧画布",
+            "rootTopic": {
+                "id": "root",
+                "title": "根主题",
+                "children": {"attached": [{"id": "a1", "title": "分支A"}]},
+            },
+        }], ensure_ascii=False))
+
+    tools = XMindTools(config)
+    result = await tools.call_tool("repair_file", {"file_path": str(broken)})
+    assert "已修复" in result[0].text
+
+    with zipfile.ZipFile(broken) as zf:
+        assert "metadata.json" in zf.namelist()
+        assert "content.xml" in zf.namelist()
+
+    read = await tools.call_tool("read_structure", {"file_path": str(broken)})
+    assert "根主题" in read[0].text
+    assert "分支A" in read[0].text
+
+
 async def test_get_node_tool(config: Config, sample_xmind: Path):
     tools = XMindTools(config)
     xm, writer = tools.workspace.get(str(sample_xmind))

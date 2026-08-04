@@ -365,6 +365,8 @@ def test_topic_class_parsed(tmp_path: Path):
 
 
 def test_create_file_and_save(tmp_path: Path):
+    import zipfile
+
     path = tmp_path / "new.xmind"
     writer = XMindWriter.create(
         str(path),
@@ -391,6 +393,74 @@ def test_create_file_and_save(tmp_path: Path):
     xm2 = parse_xmind(path)
     assert xm2.sheets[0].root.title == "根主题"
     assert len(xm2.all_topics()) == 4
+
+    # XMind 打开新文件所必需的组成部分
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+        for required in ("content.json", "metadata.json", "content.xml", "cache.json", "manifest.json"):
+            assert required in names, f"新文件缺少 {required}"
+
+        metadata = json.loads(zf.read("metadata.json"))
+        assert metadata["dataStructureVersion"] == "3"
+        assert metadata["layoutEngineVersion"] == "5"
+
+        manifest = json.loads(zf.read("manifest.json"))
+        for required in ("content.json", "metadata.json", "cache.json", "content.xml"):
+            assert required in manifest["file-entries"]
+
+        content = json.loads(zf.read("content.json"))
+        sheet = content[0]
+        assert sheet.get("revisionId")
+        assert sheet.get("theme")
+        assert sheet["rootTopic"].get("titleUnedited") is True
+        assert sheet["rootTopic"].get("structureClass")
+        assert sheet["rootTopic"].get("class") == "topic"
+        # content.xml 占位必须能作为 XML 解析
+        import xml.etree.ElementTree as ET
+
+        ET.fromstring(zf.read("content.xml"))
+
+
+def test_repair_file_missing_required_entries(tmp_path: Path):
+    """旧版本生成的文件缺 metadata.json/theme/revisionId，repair 后应能被 XMind 打开。"""
+    import zipfile
+
+    content = [{
+        "id": "sheet-1",
+        "title": "旧画布",
+        "rootTopic": {
+            "id": "root-1",
+            "title": "根主题",
+            "children": {
+                "attached": [{"id": "child-1", "title": "分支A"}],
+            },
+        },
+    }]
+    broken = tmp_path / "broken.xmind"
+    with zipfile.ZipFile(broken, "w") as zf:
+        zf.writestr("content.json", json.dumps(content, ensure_ascii=False))
+        zf.writestr("manifest.json", json.dumps({"file-entries": {"content.json": {}}}))
+
+    repaired = tmp_path / "repaired.xmind"
+    writer = XMindWriter.repair(broken, repaired)
+    assert repaired.exists()
+
+    with zipfile.ZipFile(repaired) as zf:
+        assert "metadata.json" in zf.namelist()
+        assert "content.xml" in zf.namelist()
+        manifest = json.loads(zf.read("manifest.json"))
+        assert "metadata.json" in manifest["file-entries"]
+        fixed_content = json.loads(zf.read("content.json"))
+        sheet = fixed_content[0]
+        assert sheet.get("revisionId")
+        assert sheet.get("theme")
+        assert sheet["rootTopic"].get("titleUnedited") is True
+
+    # 内容没有丢失，且能被解析器重新读取
+    xm2 = parse_xmind(repaired)
+    assert xm2.sheets[0].root.title == "根主题"
+    assert [c.title for c in xm2.sheets[0].root.children] == ["分支A"]
+    assert writer.xm.raw_content[0]["rootTopic"]["children"]["attached"][0]["class"] == "topic"
 
 
 def test_apply_matching(sample_xmind: Path):
