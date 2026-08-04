@@ -78,7 +78,7 @@ def test_server_initialize_and_list_tools(server_process: subprocess.Popen):
     list_resp = _recv(server_process)
     assert list_resp["id"] == 2
     tools = list_resp["result"]["tools"]
-    assert len(tools) == 35
+    assert len(tools) == 36
     assert any(t["name"] == "read_structure" for t in tools)
     assert any(t["name"] == "find_node" for t in tools)
     assert any(t["name"] == "export_markdown" for t in tools)

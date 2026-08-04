@@ -20,6 +20,7 @@
     save_file         — 保存修改
     create_file       — 从零新建 XMind 文件
     import_markdown   — 从 Markdown 大纲新建 XMind 文件
+    import_markdown_file — 直接读取 .md 文件，逐行原样转成 XMind（不概括、不精简）
     repair_file       — 修复打不开的 XMind 文件（补全必需组成部分）
     apply_to_matching — 按关键词批量设置样式/标记/标签
 
@@ -284,6 +285,8 @@ def _tool(name: str, description: str, properties: dict, required: list[str] = N
 
 def build_tool_list() -> list[types.Tool]:
     file_path_prop = {"type": "string", "description": ".xmind 文件路径"}
+    md_path_prop = {"type": "string", "description": "要转换的 Markdown 文件路径（.md）"}
+    output_xmind_prop = {"type": "string", "description": "生成的 .xmind 文件路径"}
 
     return [
         _tool(
@@ -450,13 +453,23 @@ def build_tool_list() -> list[types.Tool]:
         ),
         _tool(
             "import_markdown",
-            "把 Markdown 大纲（# 标题 + - 列表）转成新的 XMind 文件。",
+            "把传入的 Markdown 文本逐行原样转成新的 XMind 文件：所有文字（标题、列表、表格、代码块、引用）都会保留，不做概括或精简。必须把完整原文传给 markdown 参数；如果 Markdown 在磁盘上，请改用 import_markdown_file。",
             {
                 "file_path": file_path_prop,
-                "markdown": {"type": "string", "description": "Markdown 大纲文本"},
+                "markdown": {"type": "string", "description": "Markdown 完整原文，禁止先概括或精简"},
                 "sheet_title": {"type": "string", "description": "工作表标题（可选，默认用第一个标题）"},
             },
             ["file_path", "markdown"],
+        ),
+        _tool(
+            "import_markdown_file",
+            "直接读取磁盘上的 Markdown 文件并逐行原样转成新的 XMind 文件：所有文字（标题、列表、表格、代码块、引用）都会保留，不做概括或精简。模型只需传文件路径，不要自行改写内容。",
+            {
+                "file_path": md_path_prop,
+                "output_path": output_xmind_prop,
+                "sheet_title": {"type": "string", "description": "工作表标题（可选，默认用第一个标题）"},
+            },
+            ["file_path", "output_path"],
         ),
         _tool(
             "apply_to_matching",
@@ -1276,6 +1289,40 @@ class XMindTools:
         node_count = len(xm.all_topics())
         return f"✅ 已从 Markdown 创建文件: {file_path}\n根主题: {root_title}\n节点总数: {node_count}"
 
+    async def _import_markdown_file(self, args: dict) -> str:
+        md_path = args["file_path"]
+        output_path = args["output_path"]
+
+        raw = Path(md_path).read_bytes()
+        markdown = ""
+        for encoding in ("utf-8", "gb18030"):
+            try:
+                markdown = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if not markdown:
+            raise ValueError(f"无法读取 Markdown 文件（不是 UTF-8 或 GBK 编码）: {md_path}")
+
+        root_title, topics = _parse_markdown_outline(markdown)
+        writer = XMindWriter.create(
+            output_path,
+            root_title,
+            sheet_title=args.get("sheet_title", root_title or "画布 1"),
+            topics=topics,
+        )
+        xm = writer.xm
+        self.workspace._cache[os.path.abspath(output_path)] = (
+            os.path.getmtime(output_path),
+            xm,
+            writer,
+        )
+        node_count = len(xm.all_topics())
+        return (
+            f"✅ 已原样转换 Markdown: {output_path}\n"
+            f"来源文件: {md_path}\n根主题: {root_title}\n节点总数: {node_count}"
+        )
+
     async def _repair_file(self, args: dict) -> str:
         file_path = args["file_path"]
         output_path = args.get("output_path")
@@ -1444,6 +1491,7 @@ class XMindTools:
         "get_node": _get_node,
         "create_file": _create_file,
         "import_markdown": _import_markdown,
+        "import_markdown_file": _import_markdown_file,
         "repair_file": _repair_file,
         "apply_to_matching": _apply_to_matching,
         "analyze_file": _analyze_file,
@@ -1462,15 +1510,11 @@ def _export_node_md(node: TopicNode, depth: int, lines: list[str], include_ids: 
 
 
 def _parse_markdown_outline(markdown: str) -> tuple[str, list[dict]]:
-    """把 Markdown 大纲解析成 create_file 用的嵌套结构。
+    """把 Markdown 逐行原样解析成 create_file 用的嵌套结构。
 
-    支持两类写法：
-      # 根标题
-      - 子主题
-        - 孙主题
-    或纯列表：
-      - 根主题
-        - 子主题
+    这是“原封不动”模式：除了去掉标题/列表/引用/围栏代码的标记符号外，
+    所有文字（表格行、代码块内容、行内格式）都会保留，不做概括或精简。
+    纯分隔线（--- / *** / ___）不产生节点。
     """
     items: list[tuple[int, str]] = []
     in_fence = False
@@ -1479,19 +1523,27 @@ def _parse_markdown_outline(markdown: str) -> tuple[str, list[dict]]:
         stripped_line = raw_line.strip()
         if stripped_line.startswith("```"):
             in_fence = not in_fence
+            continue  # 围栏标记本身不保留，里面的内容保留
+        if not stripped_line:
             continue
-        if in_fence or not stripped_line:
+        # 纯分隔线不是内容，跳过
+        if not in_fence and re.fullmatch(r"[-*_]{3,}", stripped_line):
             continue
 
         indent = len(raw_line) - len(raw_line.lstrip())
-        if stripped_line.startswith("#"):
+        if in_fence:
+            # 代码块内容：原样保留，挂在最近的标题/列表下面
+            base = current_heading + 1 if current_heading else 0
+            items.append((base + indent // 2, stripped_line))
+        elif stripped_line.startswith("#"):
             heading = stripped_line.lstrip("#")
             level = len(stripped_line) - len(heading)
             text = heading.strip()
             current_heading = level
             items.append((level, text))
         else:
-            text = re.sub(r"^[-*+]\s+", "", stripped_line).strip()
+            # 去掉行首的列表符号和引用符号，保留其余原文
+            text = re.sub(r"^(?:[-*+>]\s*)+", "", stripped_line).strip()
             # 列表行挂在“最近的标题”下面；没有标题时第一行列表就是根
             base = current_heading + 1 if current_heading else 0
             items.append((base + indent // 2, text))

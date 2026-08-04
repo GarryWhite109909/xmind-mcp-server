@@ -19,6 +19,7 @@ from typing import Optional
 
 from .config import Config, CONFIG_FILE, CONFIG_DIR
 from .hardware import (
+    CUDA_RUNTIME_PACKAGES,
     detect_hardware,
     choose_packages,
     cuda_runtime_available,
@@ -96,6 +97,28 @@ def main() -> int:
     return 0
 
 
+def _ask_use_gpu() -> bool:
+    """询问用户是否用 GPU 跑 OCR（仅针对检测到 NVIDIA 显卡但未装 CUDA 的情况）。
+
+    同意则自动安装 CUDA 运行库 + onnxruntime-gpu；不同意则用 CPU。
+    """
+    print(
+        "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "检测到 NVIDIA 显卡，但未安装 CUDA 运行库。\n"
+        "是否将 OCR 运行在 GPU？\n"
+        "  • 是：自动安装 CUDA 运行库 + onnxruntime-gpu（约几百 MB）\n"
+        "  • 否：使用 CPU 运行（更简单，OCR 速度对笔记场景也够用）\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "是否启用 GPU 加速？(y/n)",
+        file=sys.stderr,
+    )
+    try:
+        answer = input().strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
+
+
 def run_setup(config: Config, engine: str = "rapidocr", force_device: str = None) -> bool:
     """首次配置：检测硬件 → 选包 → 安装 → 写配置。"""
     print("🔍 正在检测硬件...", file=sys.stderr)
@@ -117,13 +140,17 @@ def run_setup(config: Config, engine: str = "rapidocr", force_device: str = None
         and device == "cpu"
         and not cuda_runtime_available()
     ):
-        print(
-            "⚠️  检测到 NVIDIA 显卡，但没找到 CUDA 运行库（cudart64*.dll），"
-            "将直接使用 CPU。\n"
-            "    如需 GPU 加速，请先安装与 onnxruntime 匹配的 CUDA，"
-            "再运行 xmind-mcp --setup --device cuda。",
-            file=sys.stderr,
-        )
+        # 检测到 NVIDIA 显卡但缺 CUDA 运行库：询问用户是否临时安装 CUDA 走 GPU。
+        # 同意则装 nvidia CUDA 运行库 + onnxruntime-gpu；不同意则直接用 CPU。
+        if _ask_use_gpu():
+            print(
+                "📦 选择 GPU 加速：将安装 CUDA 运行库 + onnxruntime-gpu（约几百 MB）...",
+                file=sys.stderr,
+            )
+            device = "cuda"
+            packages = ["rapidocr-onnxruntime", "onnxruntime-gpu"] + CUDA_RUNTIME_PACKAGES
+        else:
+            print("已选择 CPU 运行（无需额外安装，OCR 速度对笔记场景也够用）。", file=sys.stderr)
     if force_device:
         device = force_device
         # 根据 device 调整 packages
@@ -134,6 +161,9 @@ def run_setup(config: Config, engine: str = "rapidocr", force_device: str = None
                 "cpu": "onnxruntime",
             }.get(device, "onnxruntime")
             packages = ["rapidocr-onnxruntime", ort_pkg]
+            if device == "cuda":
+                # 显式指定 CUDA 时也一并安装 pip 版 CUDA 运行库
+                packages += CUDA_RUNTIME_PACKAGES
         elif device == "cuda":
             packages = ["paddleocr", "paddlepaddle-gpu"]
         else:

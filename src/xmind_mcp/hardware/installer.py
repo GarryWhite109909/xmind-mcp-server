@@ -113,6 +113,15 @@ def uninstall_packages(packages: list[str]) -> bool:
 # onnxruntime 三个互斥包，切换设备时需卸载冲突项
 _ONNXRUNTIME_VARIANTS = ["onnxruntime", "onnxruntime-gpu", "onnxruntime-directml"]
 
+# 通过 pip 安装的 CUDA 运行库（onnxruntime-gpu 依赖这些 DLL）：
+# 相比下载官方 NVIDIA CUDA Toolkit 安装器，体积小、无需管理员权限、跨平台。
+CUDA_RUNTIME_PACKAGES = [
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cudnn-cu12",
+    "nvidia-cublas-cu12",
+    "nvidia-cudart-cu12",
+]
+
 
 def cleanup_onnxruntime_conflicts(new_device: str) -> None:
     """安装新 onnxruntime 变体前，卸载冲突的旧变体。"""
@@ -124,6 +133,36 @@ def cleanup_onnxruntime_conflicts(new_device: str) -> None:
 
     conflicts = [p for p in _ONNXRUNTIME_VARIANTS if p != keep]
     uninstall_packages(conflicts)
+
+
+def include_cuda_runtime_paths() -> None:
+    """把 pip 安装的 nvidia CUDA 运行库加入 PATH。
+
+    onnxruntime-gpu 通过 PATH 查找 cudart64_*.dll、cublas64_*.dll、cudnn*64_*.dll。
+    而 nvidia-*-cu12 系列 pip 包把 DLL 装在 site-packages/nvidia/<lib>/bin，
+    默认不在 PATH 上，会导致 onnxruntime 找不到 CUDA 库而静默回退 CPU。
+    这里在加载 onnxruntime 前把对应 bin 目录注入 PATH。
+    """
+    cuda_bin_dirs: list[str] = []
+    try:
+        from importlib.metadata import distribution
+
+        for dist_name in CUDA_RUNTIME_PACKAGES:
+            try:
+                d = distribution(dist_name)
+            except Exception:
+                continue
+            bin_dir = Path(d.locate_file("")) / "bin"
+            if bin_dir.is_dir():
+                cuda_bin_dirs.append(str(bin_dir))
+    except Exception:
+        pass
+
+    current_path = os.environ.get("PATH", "")
+    for d in cuda_bin_dirs:
+        if d not in current_path:
+            os.environ["PATH"] = d + os.pathsep + current_path
+            current_path = os.environ["PATH"]
 
 
 def verify_installed(engine: str, device: str) -> tuple[bool, str]:

@@ -26,6 +26,11 @@ class RapidOCRBackend(OCRBackend):
         """懒加载：首次调用时才导入和初始化，避免启动慢。"""
         if self._ocr is not None:
             return
+        if self._device == "cuda":
+            # 让 onnxruntime 能找到 pip 安装的 nvidia CUDA 运行库（DLL）
+            from ..hardware.installer import include_cuda_runtime_paths
+
+            include_cuda_runtime_paths()
         from rapidocr_onnxruntime import RapidOCR
 
         kwargs = {}

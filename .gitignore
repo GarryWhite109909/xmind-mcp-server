@@ -35,3 +35,6 @@ Thumbs.db
 
 # 示例文件
 examples/*.xmind
+
+# generated conversion output
+verbatim_output/

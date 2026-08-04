@@ -118,6 +118,11 @@ xmind-mcp
 3. 安装对应的推理依赖（NVIDIA 装 onnxruntime-gpu，其余默认 CPU；DirectML 可选）
 4. 写入配置到 `~/.xmind-mcp/config.json`
 
+> 💡 **GPU 提示**：如果检测到 NVIDIA 显卡但未安装 CUDA 运行库，首次运行会询问
+> 是否启用 GPU 加速。选「是」会自动安装 pip 版 CUDA 运行库 + `onnxruntime-gpu`
+> （约几百 MB）；选「否」则直接用 CPU（对笔记场景也够用）。非 NVIDIA 显卡或无
+> 检测到显卡的用户不会收到该询问，直接使用 CPU。
+
 第二次运行直接启动，无需重复配置。
 
 ### 2. 在 Trae / Claude Desktop / Cursor 中配置
@@ -200,7 +205,8 @@ xmind-mcp
 | `duplicate_node` | 复制节点（含整棵子树）到新父节点 |
 | `save_file` | 保存修改，可覆盖或另存为 |
 | `create_file` | 从零新建 XMind 文件（支持嵌套 JSON 结构） |
-| `import_markdown` | 把 Markdown 大纲转成新的 XMind 文件 |
+| `import_markdown` | 把传入的 Markdown 文本逐行原样转成 XMind（不概括、不精简） |
+| `import_markdown_file` | 直接读取磁盘上的 .md 文件，逐行原样转成 XMind（表格、代码块、引用都保留） |
 | `repair_file` | 修复打不开的 XMind 文件（自动补全必需组成部分，覆盖前自动备份） |
 | `apply_to_matching` | 按标题关键词批量设置样式、标记、标签 |
 

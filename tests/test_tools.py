@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from xmind_mcp.config import Config
+from xmind_mcp.xmind_parser import parse_xmind
 from xmind_mcp.tools import XMindTools, format_topic_tree
 
 
@@ -281,6 +282,72 @@ async def test_import_markdown_tool(config: Config, tmp_path: Path):
     assert "分支A" in text
     assert "叶子A1" in text
     assert "分支B" in text
+
+
+async def test_import_markdown_keeps_all_content(config: Config, tmp_path: Path):
+    """逐行原样转换：表格、代码块、引用都不能丢。"""
+    tools = XMindTools(config)
+    path = tmp_path / "verbatim.xmind"
+    md = (
+        "# 根主题\n"
+        "## 小节\n"
+        "- 列表项：**加粗内容**\n"
+        "- | 列A | 列B |\n"
+        "- | 1 | 2 |\n"
+        "- > 引用文字：重点内容\n"
+        "- 代码示例：\n"
+        "  ```python\n"
+        "  print('hello')\n"
+        "  ```\n"
+    )
+    result = await tools.call_tool("import_markdown", {
+        "file_path": str(path),
+        "markdown": md,
+    })
+    assert "已从 Markdown 创建" in result[0].text
+
+    read = await tools.call_tool("read_all", {"file_path": str(path)})
+    text = read[0].text
+    for expected in (
+        "加粗内容",
+        "列A",
+        "引用文字：重点内容",
+        "print('hello')",
+    ):
+        assert expected in text, f"丢失内容: {expected}"
+
+    xm = parse_xmind(path)
+    titles = [n.title for n in xm.all_topics()]
+    assert "print('hello')" in titles
+
+
+async def test_import_markdown_file_tool(config: Config, tmp_path: Path):
+    """import_markdown_file 直接读 .md 文件，逐行原样转换。"""
+    tools = XMindTools(config)
+    md_path = tmp_path / "笔记.md"
+    md_path.write_text(
+        "# 第一章 测试\n"
+        "## 1.1 概述\n"
+        "- 定义：原样保留的句子\n"
+        "- 代码示例：\n"
+        "  ```python\n"
+        "  int x = 1;\n"
+        "  ```\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "笔记.xmind"
+    result = await tools.call_tool("import_markdown_file", {
+        "file_path": str(md_path),
+        "output_path": str(out_path),
+    })
+    assert "已原样转换 Markdown" in result[0].text
+    assert out_path.exists()
+
+    xm = parse_xmind(out_path)
+    titles = [n.title for n in xm.all_topics()]
+    assert "第一章 测试" in titles
+    assert "定义：原样保留的句子" in titles
+    assert "int x = 1;" in titles
 
 
 async def test_repair_file_tool(config: Config, tmp_path: Path):
