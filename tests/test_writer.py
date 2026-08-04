@@ -111,3 +111,83 @@ def test_save_and_reload(sample_xmind: Path, tmp_path: Path):
     assert node is not None
     assert node.title == "保存测试节点"
     assert node.parent_id == "root-1"
+
+
+def test_add_nodes(sample_xmind: Path):
+    xm = parse_xmind(sample_xmind)
+    writer = XMindWriter(xm)
+    nodes = writer.add_nodes("root-1", ["批量A", "批量B", "批量C"])
+    assert len(nodes) == 3
+    assert {n.title for n in nodes} == {"批量A", "批量B", "批量C"}
+    assert all(n.parent_id == "root-1" for n in nodes)
+    assert len(xm.sheets[0].root.children) == 5  # 原有2 + 新增3
+
+
+def test_duplicate_node(sample_xmind: Path):
+    xm = parse_xmind(sample_xmind)
+    writer = XMindWriter(xm)
+    new_node = writer.duplicate_node("child-2", "root-1")
+    assert new_node is not None
+    assert new_node.id != "child-2"
+    assert new_node.title == "子节点2"
+    # 子树被复制
+    assert any(n.title == "孙节点" for n in new_node.children)
+    # 原节点仍在
+    assert xm.find_topic("child-2") is not None
+
+
+def test_duplicate_node_not_found(sample_xmind: Path):
+    xm = parse_xmind(sample_xmind)
+    writer = XMindWriter(xm)
+    assert writer.duplicate_node("nonexistent", "root-1") is None
+
+
+def test_set_node_style(sample_xmind: Path):
+    xm = parse_xmind(sample_xmind)
+    writer = XMindWriter(xm)
+    ok = writer.set_node_style("child-1", font_color="#FF0000", font_size="16pt", font_weight="bold")
+    assert ok
+    node = xm.find_topic("child-1")
+    assert node is not None
+    props = node.style.get("properties", {})
+    assert props["fo:color"] == "#FF0000"
+    assert props["fo:font-size"] == "16pt"
+    assert props["fo:font-weight"] == "bold"
+
+
+def test_set_hyperlink(sample_xmind: Path):
+    xm = parse_xmind(sample_xmind)
+    writer = XMindWriter(xm)
+    ok = writer.set_hyperlink("child-1", "https://example.com", "示例")
+    assert ok
+    node = xm.find_topic("child-1")
+    assert node.hyperlink == "https://example.com"
+
+    # 移除超链接
+    writer.set_hyperlink("child-1", "")
+    assert xm.find_topic("child-1").hyperlink == ""
+
+
+def test_add_remove_marker(sample_xmind: Path):
+    xm = parse_xmind(sample_xmind)
+    writer = XMindWriter(xm)
+    assert writer.add_marker("child-1", "priority-1")
+    assert writer.add_marker("child-1", "task-done")
+    node = xm.find_topic("child-1")
+    assert "priority-1" in node.markers
+    assert "task-done" in node.markers
+
+    assert writer.remove_marker("child-1", "priority-1")
+    assert "priority-1" not in xm.find_topic("child-1").markers
+
+
+def test_add_remove_label(sample_xmind: Path):
+    xm = parse_xmind(sample_xmind)
+    writer = XMindWriter(xm)
+    assert writer.add_label("child-1", "重点")
+    assert writer.add_label("child-1", "复习")
+    node = xm.find_topic("child-1")
+    assert "重点" in node.labels and "复习" in node.labels
+
+    assert writer.remove_label("child-1", "重点")
+    assert "重点" not in xm.find_topic("child-1").labels

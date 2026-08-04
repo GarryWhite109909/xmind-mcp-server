@@ -178,16 +178,28 @@ xmind-mcp
 | `read_image_ocr` | 对指定节点的图片做 OCR |
 | `find_node` | 按标题关键词搜索节点，返回 ID 和路径 |
 | `export_markdown` | 导出为 Markdown 大纲 |
+| `export_text` | 导出为纯文本大纲 |
 
-### 编辑类
+### 结构编辑类
 
 | 工具 | 说明 |
 |------|------|
 | `add_node` | 在指定父节点下添加子节点 |
+| `add_nodes` | 批量添加多个子节点 |
 | `update_node` | 更新节点标题 / 备注 |
 | `delete_node` | 删除节点及其子节点 |
 | `move_node` | 移动节点到新父节点下 |
+| `duplicate_node` | 复制节点（含整棵子树）到新父节点 |
 | `save_file` | 保存修改，可覆盖或另存为 |
+
+### 美化 / 标记类（让笔记更美观易读）
+
+| 工具 | 说明 |
+|------|------|
+| `set_node_style` | 设置字体、字号、颜色、加粗、斜体、背景色、边框、对齐 |
+| `set_hyperlink` | 给节点添加 / 移除超链接 |
+| `add_marker` / `remove_marker` | 添加 / 移除优先级、任务进度等图标 |
+| `add_label` / `remove_label` | 添加 / 移除标签 |
 
 所有编辑工具都支持 `auto_save=true`，设置后会自动保存，无需再手动调用 `save_file`。
 
@@ -233,6 +245,17 @@ xmind-mcp
   - 线程 `id:child-2`
 ```
 
+### 例 4：让模型美化笔记
+
+> 把 `D:\\docs\\操作系统.xmind` 里"重点"相关的节点标红加粗，并给"考试必考"的节点加优先级图标。
+
+模型会调用：
+
+1. `find_node` 找到"重点"相关节点
+2. `set_node_style` 设置 `font_color=#FF0000`、`font_weight=bold`
+3. `add_marker` 添加 `priority-1` 图标
+4. `save_file` 保存
+
 ---
 
 ## ⚙️ 命令行参数
@@ -243,6 +266,7 @@ xmind-mcp --setup            # 重新检测硬件并配置
 xmind-mcp --info             # 打印当前硬件和配置信息
 xmind-mcp --engine rapidocr  # 指定 OCR 引擎
 xmind-mcp --device cuda      # 强制指定推理设备
+xmind-mcp --uninstall        # 一键卸载（依赖 + 模型 + 配置 + 本体）
 ```
 
 切换 OCR 引擎：
@@ -250,6 +274,14 @@ xmind-mcp --device cuda      # 强制指定推理设备
 ```bash
 xmind-mcp --setup --engine paddleocr
 ```
+
+一键卸载：
+
+```bash
+xmind-mcp --uninstall
+```
+
+会依次卸载已安装的 OCR 依赖、删除模型缓存和配置文件，并询问是否同时卸载本包 `xmind-mcp-server`。
 
 ---
 

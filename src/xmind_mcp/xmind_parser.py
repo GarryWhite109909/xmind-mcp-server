@@ -60,6 +60,10 @@ class TopicNode:
     markers: list[str] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
     parent_id: str = ""
+    # 样式属性：{"style": {...}, "properties": {...}} 的原始 dict
+    style: dict = field(default_factory=dict)
+    # 超链接目标 URL
+    hyperlink: str = ""
     # 在 XMind 文件中的原始 topic dict（用于写回时定位）
     _raw: Optional[dict] = field(default=None, repr=False)
 
@@ -171,6 +175,24 @@ def _parse_image_src(topic_dict: dict) -> str:
     return image.get("src", "")
 
 
+def _parse_style(topic_dict: dict) -> dict:
+    """提取节点样式 dict。"""
+    style = topic_dict.get("style")
+    if isinstance(style, dict):
+        return style
+    return {}
+
+
+def _parse_hyperlink(topic_dict: dict) -> str:
+    """提取节点超链接 URL。"""
+    hyperlink = topic_dict.get("hyperlink")
+    if isinstance(hyperlink, dict):
+        return hyperlink.get("link", "")
+    if isinstance(hyperlink, str):
+        return hyperlink
+    return ""
+
+
 def _parse_topic(topic_dict: dict, level: int = 0, parent_id: str = "") -> TopicNode:
     """递归解析一个 topic 字典为 TopicNode。"""
     node = TopicNode(
@@ -182,6 +204,8 @@ def _parse_topic(topic_dict: dict, level: int = 0, parent_id: str = "") -> Topic
         markers=_parse_markers(topic_dict),
         labels=_parse_labels(topic_dict),
         parent_id=parent_id,
+        style=_parse_style(topic_dict),
+        hyperlink=_parse_hyperlink(topic_dict),
         _raw=topic_dict,
     )
 

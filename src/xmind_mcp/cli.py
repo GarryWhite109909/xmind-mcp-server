@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import shutil
+import subprocess
 import sys
 from dataclasses import asdict
 
-from .config import Config, CONFIG_FILE
+from .config import Config, CONFIG_FILE, CONFIG_DIR
 from .hardware import (
     detect_hardware,
     choose_packages,
     install_packages,
+    uninstall_packages,
     verify_installed,
     cleanup_onnxruntime_conflicts,
 )
@@ -41,9 +44,18 @@ def main() -> int:
         choices=["cuda", "directml", "openvino", "rocm", "cpu"],
         help="强制指定推理设备（默认自动检测）",
     )
+    parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="一键卸载：卸载 OCR 依赖、删除模型缓存和配置，可选择同时卸载本包",
+    )
     args = parser.parse_args()
 
     config = Config.load()
+
+    # --uninstall：清理所有依赖和本地数据
+    if args.uninstall:
+        return run_uninstall(config)
 
     # --info：只打印信息，不启动
     if args.info:
@@ -133,6 +145,62 @@ def run_setup(config: Config, engine: str = "rapidocr", force_device: str = None
     print(f"\n✅ 配置完成！{msg}", file=sys.stderr)
     print(f"   配置文件: {CONFIG_FILE}", file=sys.stderr)
     return True
+
+
+def run_uninstall(config: Config) -> int:
+    """一键卸载：卸载 OCR 依赖 + 删除模型缓存 + 删除配置 + 可选卸载本包。"""
+    print("🧹 开始卸载 XMind MCP Server ...\n")
+
+    # 1. 卸载 OCR 依赖
+    packages = list(config.installed_packages)
+    # 额外清理可能存在的 onnxruntime 变体
+    variants = ["onnxruntime", "onnxruntime-gpu", "onnxruntime-directml"]
+    for v in variants:
+        if v not in packages:
+            packages.append(v)
+    if config.ocr_engine == "paddleocr":
+        packages += ["paddlepaddle", "paddlepaddle-gpu"]
+    pkgs = [p for p in packages if p]
+
+    if pkgs:
+        print(f"⬇️  卸载 OCR 依赖: {', '.join(pkgs)}")
+        if uninstall_packages(pkgs):
+            print("   ✅ 依赖已卸载")
+        else:
+            print("   ⚠️ 部分依赖卸载失败，可手动执行: pip uninstall -y " + " ".join(pkgs))
+    else:
+        print("   （未检测到已安装的 OCR 依赖）")
+
+    # 2. 删除模型缓存和配置目录
+    if CONFIG_DIR.exists():
+        print(f"🗑️  删除本地数据目录: {CONFIG_DIR}")
+        try:
+            shutil.rmtree(CONFIG_DIR)
+            print("   ✅ 已删除（含 OCR 模型缓存、配置、SQLite 缓存）")
+        except Exception as e:
+            print(f"   ⚠️ 删除失败: {e}，请手动删除 {CONFIG_DIR}")
+
+    # 3. 可选卸载本包
+    print("\n是否同时卸载本包 xmind-mcp-server ？(y/n)")
+    try:
+        answer = input().strip().lower()
+    except EOFError:
+        answer = "n"
+    if answer in ("y", "yes"):
+        print("⬇️  卸载本包 xmind-mcp-server ...")
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "uninstall", "-y", "xmind-mcp-server"],
+                check=False,
+            )
+            print("   ✅ 本包已卸载")
+        except Exception as e:
+            print(f"   ⚠️ 本包卸载失败: {e}")
+    else:
+        print("   保留本包（如需完全卸载，可运行: pip uninstall xmind-mcp-server）")
+
+    print("\n🎉 卸载完成。")
+    return 0
 
 
 def print_info(config: Config) -> int:

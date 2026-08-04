@@ -177,6 +177,182 @@ class XMindWriter:
         self.xm.refresh_from_raw()
         return True
 
+    def add_nodes(self, parent_id: str, titles: list[str]) -> list[TopicNode]:
+        """在指定父节点下批量添加多个子节点。"""
+        parent_dict, _ = _find_topic_and_parent(self.xm.raw_content, parent_id)
+        if parent_dict is None:
+            raise ValueError(f"找不到父节点: {parent_id}")
+
+        attached_list = _ensure_children_attached(parent_dict)
+        new_ids = []
+        for title in titles:
+            new_id = str(uuid.uuid4())
+            attached_list.append({
+                "id": new_id,
+                "title": title,
+                "children": {"attached": [], "detached": []},
+            })
+            new_ids.append(new_id)
+
+        self.xm.refresh_from_raw()
+        nodes = [n for n in self.xm.all_topics() if n.id in new_ids]
+        return nodes
+
+    def duplicate_node(self, node_id: str, new_parent_id: str) -> Optional[TopicNode]:
+        """把节点（含其整棵子树）复制到新父节点下，生成新的 ID。"""
+        topic_dict, _ = _find_topic_and_parent(self.xm.raw_content, node_id)
+        if topic_dict is None:
+            return None
+
+        new_parent_dict, _ = _find_topic_and_parent(self.xm.raw_content, new_parent_id)
+        if new_parent_dict is None:
+            raise ValueError(f"找不到新父节点: {new_parent_id}")
+
+        # 深拷贝并重新生成所有子节点 ID
+        def _rewrite_ids(topic: dict) -> dict:
+            import copy
+            new_topic = copy.deepcopy(topic)
+            new_topic["id"] = str(uuid.uuid4())
+            children = new_topic.get("children", {})
+            if isinstance(children, dict):
+                for key in ("attached", "detached", "summary", "callout"):
+                    lst = children.get(key, [])
+                    if lst:
+                        children[key] = [_rewrite_ids(c) for c in lst]
+            return new_topic
+
+        copied = _rewrite_ids(topic_dict)
+        attached_list = _ensure_children_attached(new_parent_dict)
+        attached_list.append(copied)
+
+        self.xm.refresh_from_raw()
+        return self.xm.find_topic(copied["id"])
+
+    def set_node_style(
+        self,
+        node_id: str,
+        *,
+        font_color: Optional[str] = None,
+        font_size: Optional[str] = None,
+        font_family: Optional[str] = None,
+        font_weight: Optional[str] = None,
+        font_style: Optional[str] = None,
+        background_color: Optional[str] = None,
+        border_color: Optional[str] = None,
+        text_align: Optional[str] = None,
+    ) -> bool:
+        """设置节点样式（字体/颜色等）。值传 None 表示不修改该项。"""
+        topic_dict, _ = _find_topic_and_parent(self.xm.raw_content, node_id)
+        if topic_dict is None:
+            return False
+
+        style = topic_dict.get("style")
+        if not isinstance(style, dict):
+            style = {}
+            topic_dict["style"] = style
+        props = style.get("properties")
+        if not isinstance(props, dict):
+            props = {}
+            style["properties"] = props
+
+        mapping = {
+            "font_color": "fo:color",
+            "font_size": "fo:font-size",
+            "font_family": "fo:font-family",
+            "font_weight": "fo:font-weight",
+            "font_style": "fo:font-style",
+            "background_color": "fo:background-color",
+            "border_color": "fo:border-color",
+            "text_align": "fo:text-align",
+        }
+        for kw, fo_key in mapping.items():
+            value = locals().get(kw)
+            if value is not None:
+                props[fo_key] = value
+
+        self.xm.refresh_from_raw()
+        return True
+
+    def set_hyperlink(self, node_id: str, url: str, title: str = "") -> bool:
+        """给节点设置超链接。url 为空则移除超链接。"""
+        topic_dict, _ = _find_topic_and_parent(self.xm.raw_content, node_id)
+        if topic_dict is None:
+            return False
+
+        if not url:
+            topic_dict.pop("hyperlink", None)
+        else:
+            topic_dict["hyperlink"] = {"link": url, "title": title or url}
+
+        self.xm.refresh_from_raw()
+        return True
+
+    def add_marker(self, node_id: str, marker_id: str) -> bool:
+        """给节点添加一个标记图标（如 priority-1、task-done）。"""
+        topic_dict, _ = _find_topic_and_parent(self.xm.raw_content, node_id)
+        if topic_dict is None:
+            return False
+
+        markers = topic_dict.get("markers")
+        if not isinstance(markers, dict):
+            markers = {"markerId": []}
+            topic_dict["markers"] = markers
+        marker_list = markers.get("markerId")
+        if not isinstance(marker_list, list):
+            marker_list = []
+            markers["markerId"] = marker_list
+        if marker_id not in marker_list:
+            marker_list.append(marker_id)
+
+        self.xm.refresh_from_raw()
+        return True
+
+    def remove_marker(self, node_id: str, marker_id: str) -> bool:
+        """移除节点的指定标记图标。"""
+        topic_dict, _ = _find_topic_and_parent(self.xm.raw_content, node_id)
+        if topic_dict is None:
+            return False
+
+        markers = topic_dict.get("markers")
+        if isinstance(markers, dict) and isinstance(markers.get("markerId"), list):
+            markers["markerId"] = [m for m in markers["markerId"] if m != marker_id]
+            if not markers["markerId"]:
+                topic_dict.pop("markers", None)
+
+        self.xm.refresh_from_raw()
+        return True
+
+    def add_label(self, node_id: str, label: str) -> bool:
+        """给节点添加一个标签。"""
+        topic_dict, _ = _find_topic_and_parent(self.xm.raw_content, node_id)
+        if topic_dict is None:
+            return False
+
+        labels = topic_dict.get("labels")
+        if not isinstance(labels, list):
+            labels = []
+            topic_dict["labels"] = labels
+        if label not in labels:
+            labels.append(label)
+
+        self.xm.refresh_from_raw()
+        return True
+
+    def remove_label(self, node_id: str, label: str) -> bool:
+        """移除节点的一个标签。"""
+        topic_dict, _ = _find_topic_and_parent(self.xm.raw_content, node_id)
+        if topic_dict is None:
+            return False
+
+        labels = topic_dict.get("labels")
+        if isinstance(labels, list):
+            topic_dict["labels"] = [l for l in labels if l != label]
+            if not topic_dict["labels"]:
+                topic_dict.pop("labels", None)
+
+        self.xm.refresh_from_raw()
+        return True
+
     def save(self, output_path: Optional[Union[str, Path]] = None) -> str:
         """保存文件。output_path 为 None 时覆盖原文件。
 

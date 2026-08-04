@@ -295,6 +295,111 @@ def build_tool_list() -> list[types.Tool]:
             ["file_path"],
         ),
         _tool(
+            "export_text",
+            "把 XMind 节点树导出为纯文本大纲（带缩进层级）。",
+            {
+                "file_path": file_path_prop,
+                "include_ids": {"type": "boolean", "description": "是否在每行后输出节点 ID（默认 false）"},
+            },
+            ["file_path"],
+        ),
+        _tool(
+            "set_node_style",
+            "设置节点样式：字体、字号、文字颜色、加粗、斜体、背景色、边框色、对齐。传 None 表示不修改该项。颜色用 #RRGGBB 十六进制。",
+            {
+                "file_path": file_path_prop,
+                "node_id": {"type": "string", "description": "要设置样式的节点 ID"},
+                "font_color": {"type": "string", "description": "文字颜色，如 #FF0000"},
+                "font_size": {"type": "string", "description": "字号，如 12pt / 16pt"},
+                "font_family": {"type": "string", "description": "字体族，如 Arial / 微软雅黑"},
+                "font_weight": {"type": "string", "description": "加粗，如 bold / normal"},
+                "font_style": {"type": "string", "description": "斜体，如 italic / normal"},
+                "background_color": {"type": "string", "description": "背景色，如 #FFF3BF"},
+                "border_color": {"type": "string", "description": "边框色，如 #000000"},
+                "text_align": {"type": "string", "description": "对齐，如 left / center / right"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path", "node_id"],
+        ),
+        _tool(
+            "set_hyperlink",
+            "给节点设置超链接。url 为空则移除超链接。",
+            {
+                "file_path": file_path_prop,
+                "node_id": {"type": "string", "description": "要设置超链接的节点 ID"},
+                "url": {"type": "string", "description": "链接地址，如 https://example.com，为空则移除"},
+                "title": {"type": "string", "description": "链接显示标题（可选，默认用 url）"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path", "node_id", "url"],
+        ),
+        _tool(
+            "add_marker",
+            "给节点添加标记图标。常用：priority-1~9（优先级）、task-start/task-oct/task-quarter/task-half/task-3q/task-done/task-pause（任务进度）、smiley-*、flag-*、star-*。",
+            {
+                "file_path": file_path_prop,
+                "node_id": {"type": "string", "description": "要添加标记的节点 ID"},
+                "marker_id": {"type": "string", "description": "标记 ID，如 priority-1、task-done"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path", "node_id", "marker_id"],
+        ),
+        _tool(
+            "remove_marker",
+            "移除节点的指定标记图标。",
+            {
+                "file_path": file_path_prop,
+                "node_id": {"type": "string", "description": "节点 ID"},
+                "marker_id": {"type": "string", "description": "要移除的标记 ID"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path", "node_id", "marker_id"],
+        ),
+        _tool(
+            "add_label",
+            "给节点添加一个标签。",
+            {
+                "file_path": file_path_prop,
+                "node_id": {"type": "string", "description": "节点 ID"},
+                "label": {"type": "string", "description": "标签文本"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path", "node_id", "label"],
+        ),
+        _tool(
+            "remove_label",
+            "移除节点的一个标签。",
+            {
+                "file_path": file_path_prop,
+                "node_id": {"type": "string", "description": "节点 ID"},
+                "label": {"type": "string", "description": "要移除的标签文本"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path", "node_id", "label"],
+        ),
+        _tool(
+            "add_nodes",
+            "批量添加多个子节点到指定父节点下。",
+            {
+                "file_path": file_path_prop,
+                "parent_id": {"type": "string", "description": "父节点 ID"},
+                "titles": {"type": "array", "items": {"type": "string"}, "description": "要添加的子节点标题列表"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path", "parent_id", "titles"],
+        ),
+        _tool(
+            "duplicate_node",
+            "把节点（含其整棵子树）复制到新父节点下，生成新的 ID。",
+            {
+                "file_path": file_path_prop,
+                "node_id": {"type": "string", "description": "要复制的节点 ID"},
+                "new_parent_id": {"type": "string", "description": "目标父节点 ID"},
+                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
+            },
+            ["file_path", "node_id", "new_parent_id"],
+        ),
+        _tool(
             "get_hardware_info",
             "获取当前机器的硬件检测结果和 OCR 引擎配置信息。",
             {},
@@ -540,6 +645,110 @@ class XMindTools:
             lines.append("")
         return "\n".join(lines).strip()
 
+    async def _export_text(self, args: dict) -> str:
+        xm, _ = self.workspace.get(args["file_path"])
+        include_ids = args.get("include_ids", False)
+        lines = []
+        for sheet in xm.sheets:
+            lines.append(f"📄 {sheet.title}")
+            lines.append("")
+            self._export_node_text(sheet.root, 0, lines, include_ids)
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _export_node_text(self, node: TopicNode, depth: int, lines: list[str], include_ids: bool) -> None:
+        indent = "  " * depth
+        title = _clean_title(node.title) or "📷图片"
+        id_part = f" [{node.id}]" if include_ids else ""
+        lines.append(f"{indent}- {title}{id_part}")
+        for child in node.children:
+            self._export_node_text(child, depth + 1, lines, include_ids)
+
+    async def _set_node_style(self, args: dict) -> str:
+        file_path = args["file_path"]
+        xm, writer = self.workspace.get(file_path)
+        kwargs = {k: args.get(k) for k in (
+            "font_color", "font_size", "font_family", "font_weight",
+            "font_style", "background_color", "border_color", "text_align",
+        )}
+        success = writer.set_node_style(args["node_id"], **kwargs)
+        if not success:
+            return f"❌ 找不到节点: {args['node_id']}"
+        return self._auto_save_msg(file_path, writer, args, f"✅ 节点 {args['node_id']} 样式已更新。")
+
+    async def _set_hyperlink(self, args: dict) -> str:
+        file_path = args["file_path"]
+        xm, writer = self.workspace.get(file_path)
+        success = writer.set_hyperlink(args["node_id"], args["url"], args.get("title", ""))
+        if not success:
+            return f"❌ 找不到节点: {args['node_id']}"
+        return self._auto_save_msg(file_path, writer, args, f"✅ 节点 {args['node_id']} 超链接已{'移除' if not args['url'] else '设置'}。")
+
+    async def _add_marker(self, args: dict) -> str:
+        file_path = args["file_path"]
+        xm, writer = self.workspace.get(file_path)
+        success = writer.add_marker(args["node_id"], args["marker_id"])
+        if not success:
+            return f"❌ 找不到节点: {args['node_id']}"
+        return self._auto_save_msg(file_path, writer, args, f"✅ 节点 {args['node_id']} 已添加标记 {args['marker_id']}。")
+
+    async def _remove_marker(self, args: dict) -> str:
+        file_path = args["file_path"]
+        xm, writer = self.workspace.get(file_path)
+        success = writer.remove_marker(args["node_id"], args["marker_id"])
+        if not success:
+            return f"❌ 找不到节点: {args['node_id']}"
+        return self._auto_save_msg(file_path, writer, args, f"✅ 节点 {args['node_id']} 已移除标记 {args['marker_id']}。")
+
+    async def _add_label(self, args: dict) -> str:
+        file_path = args["file_path"]
+        xm, writer = self.workspace.get(file_path)
+        success = writer.add_label(args["node_id"], args["label"])
+        if not success:
+            return f"❌ 找不到节点: {args['node_id']}"
+        return self._auto_save_msg(file_path, writer, args, f"✅ 节点 {args['node_id']} 已添加标签 '{args['label']}'。")
+
+    async def _remove_label(self, args: dict) -> str:
+        file_path = args["file_path"]
+        xm, writer = self.workspace.get(file_path)
+        success = writer.remove_label(args["node_id"], args["label"])
+        if not success:
+            return f"❌ 找不到节点: {args['node_id']}"
+        return self._auto_save_msg(file_path, writer, args, f"✅ 节点 {args['node_id']} 已移除标签 '{args['label']}'。")
+
+    async def _add_nodes(self, args: dict) -> str:
+        file_path = args["file_path"]
+        xm, writer = self.workspace.get(file_path)
+        try:
+            nodes = writer.add_nodes(args["parent_id"], args["titles"])
+        except ValueError as e:
+            return f"❌ {e}"
+        if not nodes:
+            return "❌ 未能添加任何节点。"
+        ids = ", ".join(n.id for n in nodes)
+        msg = f"✅ 已添加 {len(nodes)} 个节点：{ids}"
+        return self._auto_save_msg(file_path, writer, args, msg, fresh_save=True)
+
+    async def _duplicate_node(self, args: dict) -> str:
+        file_path = args["file_path"]
+        xm, writer = self.workspace.get(file_path)
+        try:
+            new_node = writer.duplicate_node(args["node_id"], args["new_parent_id"])
+        except ValueError as e:
+            return f"❌ {e}"
+        if new_node is None:
+            return f"❌ 找不到节点: {args['node_id']}"
+        msg = f"✅ 已复制节点到 {args['new_parent_id']} 下，新 ID: {new_node.id}"
+        return self._auto_save_msg(file_path, writer, args, msg, fresh_save=True)
+
+    def _auto_save_msg(self, file_path: str, writer: XMindWriter, args: dict, msg: str, fresh_save: bool = False) -> str:
+        """编辑后统一处理保存提示。"""
+        if args.get("auto_save"):
+            saved_path = writer.save()
+            self.workspace.refresh_after_save(saved_path)
+            return f"{msg}\n✅ 已自动保存到: {saved_path}"
+        return f"{msg}\n⚠️ 修改未保存，请调用 save_file 或设置 auto_save=true。"
+
     async def _get_hardware_info(self, args: dict) -> str:
         c = self.config
         lines = [
@@ -570,6 +779,15 @@ class XMindTools:
         "move_node": _move_node,
         "save_file": _save_file,
         "export_markdown": _export_markdown,
+        "export_text": _export_text,
+        "set_node_style": _set_node_style,
+        "set_hyperlink": _set_hyperlink,
+        "add_marker": _add_marker,
+        "remove_marker": _remove_marker,
+        "add_label": _add_label,
+        "remove_label": _remove_label,
+        "add_nodes": _add_nodes,
+        "duplicate_node": _duplicate_node,
         "get_hardware_info": _get_hardware_info,
     }
 
