@@ -97,11 +97,26 @@ def main() -> int:
     return 0
 
 
+def _is_interactive() -> bool:
+    """判断当前是否运行在交互式终端（有 TTY 可读输入）。
+
+    MCP 客户端通过 stdio 启动 server 时，stdin 被 MCP 协议占用，
+    不是 TTY。此时绝不能阻塞读 stdin，否则会读到协议数据或卡死。
+    """
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
 def _ask_use_gpu() -> bool:
     """询问用户是否用 GPU 跑 OCR（仅针对检测到 NVIDIA 显卡但未装 CUDA 的情况）。
 
     同意则自动安装 CUDA 运行库 + onnxruntime-gpu；不同意则用 CPU。
+    非交互环境（如 MCP 客户端启动）下自动跳过，回退 CPU。
     """
+    if not _is_interactive():
+        return False
     print(
         "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "检测到 NVIDIA 显卡，但未安装 CUDA 运行库。\n"

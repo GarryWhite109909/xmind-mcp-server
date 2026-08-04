@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xmind-mcp-server"
-version = "0.2.3"
+version = "0.2.4"
 description = "让大模型读写 XMind 文件，支持图片 OCR 的 MCP Server"
 readme = "README.md"
 license = {text = "MIT"}
@@ -27,13 +27,12 @@ dependencies = [
     "mcp>=2.0.0",
     "psutil>=5.9.0",
     "Pillow>=10.0.0",
-]
-
-[project.optional-dependencies]
-rapidocr = [
+    # OCR 依赖设为必装，保证 pip install 后开箱即用（首次启动只需下载模型）
     "rapidocr-onnxruntime>=1.2.0",
     "onnxruntime>=1.16.0",
 ]
+
+[project.optional-dependencies]
 paddleocr = [
     "paddleocr>=2.7.0",
     "paddlepaddle>=2.6.0",
@@ -43,8 +42,6 @@ dev = [
     "pytest-asyncio>=0.21.0",
 ]
 all = [
-    "rapidocr-onnxruntime>=1.2.0",
-    "onnxruntime>=1.16.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
 ]
