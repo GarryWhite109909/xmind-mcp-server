@@ -4,6 +4,7 @@ from .detector import HardwareInfo, GPUInfo, detect_hardware
 from .installer import (
     choose_packages,
     cleanup_onnxruntime_conflicts,
+    cuda_runtime_available,
     install_packages,
     uninstall_packages,
     verify_installed,
@@ -18,4 +19,5 @@ __all__ = [
     "uninstall_packages",
     "verify_installed",
     "cleanup_onnxruntime_conflicts",
+    "cuda_runtime_available",
 ]

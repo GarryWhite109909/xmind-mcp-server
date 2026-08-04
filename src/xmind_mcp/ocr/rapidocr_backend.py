@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
-import time
 import io
+import sys
+import time
 from typing import Optional
 
 from PIL import Image
@@ -27,10 +28,32 @@ class RapidOCRBackend(OCRBackend):
             return
         from rapidocr_onnxruntime import RapidOCR
 
-        # RapidOCR 内部用 onnxruntime 的 provider 自动选择
-        # 这里可以通过参数指定，但 RapidOCR 构造参数随版本变化
-        # 让它自动选即可，onnxruntime 会用安装的 provider
-        self._ocr = RapidOCR()
+        kwargs = {}
+        if self._device == "cuda":
+            # 让 RapidOCR 为 det/cls/rec 三个模型都启用 CUDA
+            kwargs.update(
+                det_use_cuda=True,
+                cls_use_cuda=True,
+                rec_use_cuda=True,
+            )
+        elif self._device == "directml":
+            # DirectML 需要 rapidocr-onnxruntime >= 1.3.23；老版本没有 use_dml 开关，
+            # 传进去会被静默忽略，导致用户以为在用 DirectML 实际在跑 CPU。
+            if _rapidocr_supports_dml():
+                kwargs.update(
+                    det_use_dml=True,
+                    cls_use_dml=True,
+                    rec_use_dml=True,
+                )
+            else:
+                print(
+                    "[xmind-mcp/ocr] 当前 rapidocr-onnxruntime 版本不支持 DirectML，"
+                    "已回退 CPU。请升级 rapidocr-onnxruntime>=1.3.23 或使用 --device cpu。",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        self._ocr = RapidOCR(**kwargs)
 
     @staticmethod
     def _to_numpy(image: ImageInput):
@@ -112,3 +135,20 @@ class RapidOCRBackend(OCRBackend):
             gc.collect()
         except Exception:
             pass
+
+
+def _rapidocr_supports_dml() -> bool:
+    """检测当前 rapidocr-onnxruntime 是否支持 DirectML 开关。"""
+    try:
+        from importlib.metadata import version
+
+        raw = version("rapidocr-onnxruntime")
+        parts = []
+        for piece in raw.split(".")[:3]:
+            digits = "".join(ch for ch in piece if ch.isdigit())
+            parts.append(int(digits) if digits else 0)
+        while len(parts) < 3:
+            parts.append(0)
+        return parts >= [1, 3, 23]
+    except Exception:
+        return False

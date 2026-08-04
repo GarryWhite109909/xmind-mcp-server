@@ -7,6 +7,14 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolated_backup_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """把自动备份目录重定向到临时目录，避免测试污染用户主目录。"""
+    from xmind_mcp import xmind_writer
+
+    monkeypatch.setattr(xmind_writer, "BACKUP_DIR", tmp_path / "backups")
+
+
 @pytest.fixture
 def sample_xmind(tmp_path: Path) -> Path:
     """创建一个用于测试的临时 XMind 文件。"""

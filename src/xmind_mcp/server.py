@@ -19,6 +19,7 @@ from mcp.server.models import InitializationOptions
 
 from .config import Config
 from .tools import XMindTools, build_tool_list
+from . import __version__
 
 
 def _log(msg: str) -> None:
@@ -108,7 +109,7 @@ async def run_server(config: Config) -> None:
 
     init_options = InitializationOptions(
         server_name="xmind-mcp-server",
-        server_version="0.1.0",
+        server_version=__version__,
         capabilities=types.ServerCapabilities(
             tools=types.ToolsCapability(),
         ),

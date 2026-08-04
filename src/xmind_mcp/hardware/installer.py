@@ -4,7 +4,7 @@
 
   engine=rapidocr:
     NVIDIA           → onnxruntime-gpu      (CUDA)
-    AMD/Intel + Win  → onnxruntime-directml (DirectML)
+    AMD/Intel        → onnxruntime          (CPU)
     其他             → onnxruntime          (CPU)
 
   engine=paddleocr:
@@ -12,16 +12,22 @@
     其他             → paddlepaddle         (CPU)
 
 注意 onnxruntime / onnxruntime-gpu / onnxruntime-directml 三者互斥，
-切换时需先卸载旧的。
+切换时需先卸载旧的。DirectML 需要 rapidocr-onnxruntime>=1.3.23，
+且 AMD/Intel 独显加速收益不稳定，因此默认不推荐，可通过
+`--setup --device directml` 显式开启。
 """
 
 from __future__ import annotations
 
+import glob
+import os
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 from typing import Optional
 
-from .detector import HardwareInfo, has_nvidia_gpu, has_discrete_gpu
+from .detector import HardwareInfo, has_nvidia_gpu
 
 
 def choose_packages(
@@ -34,21 +40,50 @@ def choose_packages(
         (device, packages) — device 是推理设备标识，packages 是要 pip install 的列表
     """
     nvidia = has_nvidia_gpu(hw)
-    discrete = has_discrete_gpu(hw)
 
     if engine == "paddleocr":
         if nvidia:
             return "cuda", ["paddleocr", "paddlepaddle-gpu"]
         return "cpu", ["paddleocr", "paddlepaddle"]
 
-    # 默认 rapidocr
-    if nvidia:
+    # 默认 rapidocr：有 NVIDIA 且能找到 CUDA 运行库才选 GPU，
+    # 否则直接 CPU，避免给用户白下载几百 MB 的 onnxruntime-gpu。
+    if nvidia and cuda_runtime_available():
         return "cuda", ["rapidocr-onnxruntime", "onnxruntime-gpu"]
-    if discrete and hw.os == "windows":
-        # AMD / Intel 独显 + Windows → DirectML
-        return "directml", ["rapidocr-onnxruntime", "onnxruntime-directml"]
     # 兜底 CPU
     return "cpu", ["rapidocr-onnxruntime", "onnxruntime"]
+
+
+def cuda_runtime_available() -> bool:
+    """粗略检测本机是否具备跑 onnxruntime-gpu 的 CUDA 运行库。
+
+    onnxruntime-gpu 的 pip 包不捆绑 CUDA/cuDNN DLL，装完没有运行库也
+    用不了 GPU，只会白白占用下载时间和磁盘。这里在装包前先查一下
+    cudart64*.dll 是否存在。
+    """
+    if sys.platform != "win32":
+        # Linux/macOS 走系统 CUDA，这里只做保守判断：能跑 nvidia-smi 就尝试 GPU
+        return shutil.which("nvidia-smi") is not None
+
+    search_dirs: list[Path] = []
+    cuda_path = os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME")
+    if cuda_path:
+        search_dirs.append(Path(cuda_path) / "bin")
+    toolkit_root = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA")
+    if toolkit_root.is_dir():
+        search_dirs.extend(
+            version_dir / "bin"
+            for version_dir in toolkit_root.iterdir()
+            if version_dir.is_dir()
+        )
+    for d in search_dirs:
+        if d.is_dir() and any(d.glob("cudart64*.dll")):
+            return True
+
+    for path_entry in os.environ.get("PATH", "").split(os.pathsep):
+        if path_entry and glob.glob(os.path.join(path_entry, "cudart64*.dll")):
+            return True
+    return False
 
 
 def install_packages(packages: list[str]) -> bool:
@@ -94,26 +129,70 @@ def cleanup_onnxruntime_conflicts(new_device: str) -> None:
 def verify_installed(engine: str, device: str) -> tuple[bool, str]:
     """验证 OCR 引擎是否可用，返回 (是否可用, 说明)。"""
     if engine == "rapidocr":
+        if device not in ("cuda", "directml", "cpu"):
+            return False, f"rapidocr 不支持推理设备: {device}（仅支持 cuda/directml/cpu）"
         try:
             import rapidocr_onnxruntime  # noqa: F401
             import onnxruntime as ort  # noqa: F401
             providers = ort.get_available_providers()
-            # 检查目标 provider 是否在列表里
             target = {
                 "cuda": "CUDAExecutionProvider",
                 "directml": "DmlExecutionProvider",
                 "cpu": "CPUExecutionProvider",
             }.get(device, "CPUExecutionProvider")
             if target in providers:
+                if device == "cuda" and ort.get_device() != "GPU":
+                    return False, (
+                        f"onnxruntime 检测到 CUDAExecutionProvider，但 get_device()="
+                        f"{ort.get_device()}，实际无法使用 GPU。请运行 "
+                        f"xmind-mcp --setup --device cpu。"
+                    )
+                if device == "directml":
+                    if not _rapidocr_dml_ok():
+                        return False, (
+                            "DirectML 需要 rapidocr-onnxruntime>=1.3.23，"
+                            "当前版本不支持。请运行 xmind-mcp --setup --device cpu。"
+                        )
+                    return True, "rapidocr 可用，provider=DmlExecutionProvider"
                 return True, f"rapidocr 可用，provider={target}"
-            return True, f"rapidocr 已装但 {target} 不可用，实际 providers={providers}，将回退 CPU"
+            return False, (
+                f"rapidocr 已安装，但 {target} 不可用，实际 providers={providers}。"
+                f"请运行 xmind-mcp --setup --device cpu。"
+            )
         except ImportError as e:
             return False, f"rapidocr 未安装: {e}"
     elif engine == "paddleocr":
+        if device not in ("cuda", "cpu"):
+            return False, f"paddleocr 不支持推理设备: {device}（仅支持 cuda/cpu）"
         try:
             import paddleocr  # noqa: F401
             import paddle  # noqa: F401
+            if device == "cuda":
+                if not paddle.device.is_compiled_with_cuda():
+                    return False, (
+                        "paddlepaddle 不是 CUDA 版本，无法使用 GPU。"
+                        "请运行 xmind-mcp --setup --device cpu，"
+                        "或安装 paddlepaddle-gpu。"
+                    )
+                return True, "paddleocr 可用（CUDA）"
             return True, "paddleocr 可用"
         except ImportError as e:
             return False, f"paddleocr 未安装: {e}"
     return False, f"未知引擎: {engine}"
+
+
+def _rapidocr_dml_ok() -> bool:
+    """当前 rapidocr-onnxruntime 是否支持 DirectML（>=1.3.23）。"""
+    try:
+        from importlib.metadata import version
+
+        raw = version("rapidocr-onnxruntime")
+        parts = []
+        for piece in raw.split(".")[:3]:
+            digits = "".join(ch for ch in piece if ch.isdigit())
+            parts.append(int(digits) if digits else 0)
+        while len(parts) < 3:
+            parts.append(0)
+        return parts >= [1, 3, 23]
+    except Exception:
+        return False

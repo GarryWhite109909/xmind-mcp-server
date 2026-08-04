@@ -59,6 +59,7 @@ def _run(cmd: list[str], timeout: int = 10) -> str:
             cmd,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
             shell=False,
         )
@@ -74,6 +75,7 @@ def _run_shell(cmd: str, timeout: int = 10) -> str:
             cmd,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
             shell=True,
         )
@@ -86,11 +88,54 @@ def _run_shell(cmd: str, timeout: int = 10) -> str:
 
 def _gpus_windows() -> list[str]:
     """Windows: 用 PowerShell 查显卡名称。"""
-    out = _run_shell(
-        'powershell -Command "Get-CimInstance Win32_VideoController '
-        '| Select-Object -ExpandProperty Name"'
-    )
-    return [line.strip() for line in out.splitlines() if line.strip()]
+    out = _run([
+        "powershell", "-NoProfile", "-Command",
+        "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+    ])
+    names = [line.strip() for line in out.splitlines() if line.strip()]
+    if names:
+        return names
+
+    # PowerShell/WMI 不可用时回退到 wmic（旧系统）或注册表
+    out = _run(["wmic", "path", "win32_VideoController", "get", "name", "/value"])
+    names = [
+        line.strip().split("=", 1)[-1].strip()
+        for line in out.splitlines()
+        if line.strip() and "=" in line
+    ]
+    if names:
+        return names
+    return _gpus_windows_registry()
+
+
+def _gpus_windows_registry() -> list[str]:
+    """最后回退：从显卡驱动注册表键读名称。"""
+    try:
+        import winreg
+    except ImportError:
+        return []
+
+    names: list[str] = []
+    key_path = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as parent:
+            index = 0
+            while True:
+                try:
+                    sub_name = winreg.EnumKey(parent, index)
+                except OSError:
+                    break
+                index += 1
+                try:
+                    with winreg.OpenKey(parent, sub_name) as sub:
+                        desc, _ = winreg.QueryValueEx(sub, "DriverDesc")
+                        if isinstance(desc, str) and desc not in names:
+                            names.append(desc)
+                except OSError:
+                    continue
+    except OSError:
+        return []
+    return names
 
 
 def _gpus_linux() -> list[str]:
@@ -128,9 +173,13 @@ def _gpus_macos() -> list[str]:
 
 def _nvidia_vram_smi() -> dict[str, int]:
     """用 nvidia-smi 查每张 NVIDIA 显卡的显存，返回 {显卡名: 显存MB}。"""
-    out = _run_shell(
-        'nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>/dev/null'
-    )
+    # 注意：不要用 shell + `2>/dev/null`，Windows cmd 不认 /dev/null，
+    # 会导致整个命令失败。stderr 由 capture_output 吞掉即可。
+    out = _run([
+        "nvidia-smi",
+        "--query-gpu=name,memory.total",
+        "--format=csv,noheader,nounits",
+    ])
     result = {}
     for line in out.splitlines():
         parts = [p.strip() for p in line.split(",")]

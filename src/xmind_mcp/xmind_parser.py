@@ -52,6 +52,14 @@ class TopicNode:
     id: str
     title: str
     level: int = 0  # 中心主题=0，第一层子主题=1，以此类推
+    # 所在工作表索引（用于查询该表的主题样式）
+    sheet_index: int = 0
+    # 节点在文件中的真实类别：root / attached / detached / summary / callout
+    # summary 和 callout 是 XMind 的视觉元素（概要/批注），不是普通主题，
+    # 模型看到后应避免把它们当普通子主题来编辑。
+    topic_class: str = "attached"
+    # XMind 的 class 属性：topic / importantTopic（重要主题）/ minorTopic 等
+    xmind_class: str = ""
     children: list["TopicNode"] = field(default_factory=list)
     notes: str = ""
     # 图片：src 是引用路径，data 是二进制内容（调用 load_image 后填充）
@@ -62,6 +70,8 @@ class TopicNode:
     parent_id: str = ""
     # 样式属性：{"style": {...}, "properties": {...}} 的原始 dict
     style: dict = field(default_factory=dict)
+    # 布局结构（根主题上的 structureClass），如 org.xmind.ui.map.clockwise
+    structure_class: str = ""
     # 超链接目标 URL
     hyperlink: str = ""
     # 在 XMind 文件中的原始 topic dict（用于写回时定位）
@@ -117,9 +127,14 @@ class XMindFile:
     def refresh_from_raw(self) -> None:
         """根据修改后的 raw_content 重新生成解析树。"""
         self.sheets = []
-        for sheet_dict in self.raw_content:
+        for sheet_index, sheet_dict in enumerate(self.raw_content):
             root_dict = sheet_dict.get("rootTopic", {})
-            root_node = _parse_topic(root_dict, level=0)
+            root_node = _parse_topic(
+                root_dict,
+                level=0,
+                topic_class="root",
+                sheet_index=sheet_index,
+            )
             self.sheets.append(XMindSheet(
                 id=sheet_dict.get("id", ""),
                 title=sheet_dict.get("title", ""),
@@ -193,18 +208,28 @@ def _parse_hyperlink(topic_dict: dict) -> str:
     return ""
 
 
-def _parse_topic(topic_dict: dict, level: int = 0, parent_id: str = "") -> TopicNode:
+def _parse_topic(
+    topic_dict: dict,
+    level: int = 0,
+    parent_id: str = "",
+    topic_class: str = "attached",
+    sheet_index: int = 0,
+) -> TopicNode:
     """递归解析一个 topic 字典为 TopicNode。"""
     node = TopicNode(
         id=topic_dict.get("id", ""),
         title=topic_dict.get("title", ""),
         level=level,
+        sheet_index=sheet_index,
+        topic_class=topic_class,
+        xmind_class=topic_dict.get("class", ""),
         notes=_parse_notes(topic_dict),
         image_src=_parse_image_src(topic_dict),
         markers=_parse_markers(topic_dict),
         labels=_parse_labels(topic_dict),
         parent_id=parent_id,
         style=_parse_style(topic_dict),
+        structure_class=topic_dict.get("structureClass", ""),
         hyperlink=_parse_hyperlink(topic_dict),
         _raw=topic_dict,
     )
@@ -214,7 +239,13 @@ def _parse_topic(topic_dict: dict, level: int = 0, parent_id: str = "") -> Topic
         child_list = children.get(key, []) if isinstance(children, dict) else []
         for child_dict in child_list:
             if isinstance(child_dict, dict):
-                child_node = _parse_topic(child_dict, level=level + 1, parent_id=node.id)
+                child_node = _parse_topic(
+                    child_dict,
+                    level=level + 1,
+                    parent_id=node.id,
+                    topic_class=key,
+                    sheet_index=sheet_index,
+                )
                 node.children.append(child_node)
 
     return node
@@ -303,9 +334,14 @@ def parse_xmind(file_path: Union[str, Path]) -> XMindFile:
         content_raw = [content_raw]
 
     sheets: list[XMindSheet] = []
-    for sheet_dict in content_raw:
+    for sheet_index, sheet_dict in enumerate(content_raw):
         root_dict = sheet_dict.get("rootTopic", {})
-        root_node = _parse_topic(root_dict, level=0)
+        root_node = _parse_topic(
+            root_dict,
+            level=0,
+            topic_class="root",
+            sheet_index=sheet_index,
+        )
         sheets.append(XMindSheet(
             id=sheet_dict.get("id", ""),
             title=sheet_dict.get("title", ""),
@@ -332,3 +368,18 @@ def load_topic_image(topic: TopicNode, xm: XMindFile) -> Optional[bytes]:
     data = load_image_data(topic.image_src, zf)
     topic.image_data = data  # 缓存到节点上
     return data
+
+
+def topic_ids_in_subtree(topic_dict: dict) -> set[str]:
+    """收集一个 raw topic dict 及其所有子节点的 ID（用于删除时清理引用）。"""
+    ids = set()
+    if not isinstance(topic_dict, dict) or not topic_dict.get("id"):
+        return ids
+    ids.add(topic_dict["id"])
+    children = topic_dict.get("children", {})
+    if isinstance(children, dict):
+        for key in ("attached", "detached", "summary", "callout"):
+            for child in children.get(key, []):
+                if isinstance(child, dict):
+                    ids |= topic_ids_in_subtree(child)
+    return ids

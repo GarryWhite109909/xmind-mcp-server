@@ -10,6 +10,8 @@ from typing import Optional
 
 CONFIG_DIR = Path.home() / ".xmind-mcp"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+# 覆盖保存前的自动备份目录
+BACKUP_DIR = CONFIG_DIR / "backups"
 
 
 @dataclass
@@ -28,8 +30,6 @@ class Config:
     ram_gb: float = 0.0
     # 操作系统：windows | linux | macos
     os: str = ""
-    # OCR 模型缓存目录
-    model_cache_dir: str = ""
     # 是否已完成首次安装
     initialized: bool = False
     # 安装时用的 pip 包列表（用于二次验证）

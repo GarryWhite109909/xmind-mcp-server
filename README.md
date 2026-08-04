@@ -45,18 +45,24 @@ XMind MCP Server 是一个基于 [Model Context Protocol (MCP)](https://modelcon
 
 ### 4. 自动硬件检测与最佳配置
 
-首次启动自动检测 GPU、CPU、内存，并选择最适合的推理后端：
+首次启动自动检测 GPU、CPU、内存，并选择最适合的推理后端；
+如果配置的设备实际不可用（例如 CUDA 库缺失），启动时会自动回退到 CPU 并修正配置：
 
 | 显卡 | Windows | Linux | macOS |
 |------|---------|-------|-------|
 | NVIDIA | CUDA ✅ | CUDA ✅ | CPU |
-| AMD | DirectML ✅ | CPU | CPU |
-| Intel | DirectML ✅ | CPU | CPU |
+| AMD | CPU（可手动开启 DirectML）| CPU | CPU |
+| Intel | CPU（可手动开启 DirectML）| CPU | CPU |
 | 无独显 | CPU ✅ | CPU ✅ | CPU ✅ |
+
+> DirectML 需要 `rapidocr-onnxruntime>=1.3.23`，且收益不稳定，因此默认不推荐；
+> 需要时用 `xmind-mcp --setup --device directml` 显式开启。
 
 ### 5. 安全写回，保留原文件结构
 
-保存时不会破坏 XMind 文件中的样式、主题、附件、manifest 等资源，只修改 `content.json`，再安全重组 ZIP。
+保存时不会破坏 XMind 文件中的样式、主题、附件、manifest 等资源，只修改
+`content.json`，再安全重组 ZIP。**覆盖保存原文件前会自动备份到
+`~/.xmind-mcp/backups/`（每个文件保留最近 20 份）**，模型改坏了也能找回。
 
 ---
 
@@ -109,7 +115,7 @@ xmind-mcp
 
 1. 检测操作系统、CPU、内存、显卡
 2. 选择合适的 OCR 引擎和推理设备
-3. 安装对应的推理依赖（如 onnxruntime-gpu / directml）
+3. 安装对应的推理依赖（NVIDIA 装 onnxruntime-gpu，其余默认 CPU；DirectML 可选）
 4. 写入配置到 `~/.xmind-mcp/config.json`
 
 第二次运行直接启动，无需重复配置。
@@ -173,10 +179,12 @@ xmind-mcp
 | 工具 | 说明 |
 |------|------|
 | `read_structure` | 读取节点树结构，默认输出层级 + 节点 ID |
-| `read_all` | 节点树 + 图片 OCR + notes/labels/markers 元数据 |
+| `read_all` | 节点树 + 图片 OCR + notes/labels/markers/超链接/样式元数据，支持 `max_depth` / `max_nodes` 防爆上下文 |
 | `list_images` | 列出所有含图片的节点 |
 | `read_image_ocr` | 对指定节点的图片做 OCR |
 | `find_node` | 按标题关键词搜索节点，返回 ID 和路径 |
+| `get_node` | 读取单个节点完整信息（含主题类型、节点自身样式、主题继承样式、超链接、父节点） |
+| `analyze_file` | 文件统计/体检：节点数、深度、重复标题、空节点等 |
 | `export_markdown` | 导出为 Markdown 大纲 |
 | `export_text` | 导出为纯文本大纲 |
 
@@ -188,16 +196,26 @@ xmind-mcp
 | `add_nodes` | 批量添加多个子节点 |
 | `update_node` | 更新节点标题 / 备注 |
 | `delete_node` | 删除节点及其子节点 |
-| `move_node` | 移动节点到新父节点下 |
+| `move_node` | 移动节点到新父节点下，可指定 `before_id` / `after_id` 插入位置 |
 | `duplicate_node` | 复制节点（含整棵子树）到新父节点 |
 | `save_file` | 保存修改，可覆盖或另存为 |
+| `create_file` | 从零新建 XMind 文件（支持嵌套 JSON 结构） |
+| `import_markdown` | 把 Markdown 大纲转成新的 XMind 文件 |
+| `apply_to_matching` | 按标题关键词批量设置样式、标记、标签 |
 
 ### 美化 / 标记类（让笔记更美观易读）
 
 | 工具 | 说明 |
 |------|------|
-| `set_node_style` | 设置字体、字号、颜色、加粗、斜体、背景色、边框、对齐 |
+| `set_node_style` | 设置字体、字号、颜色、加粗、斜体、背景色、边框色/宽度、节点形状、连线颜色/宽度、对齐 |
+| `set_sheet_layout` | 切换工作表布局（思维导图/逻辑图/树形图/组织结构图等） |
+| `apply_style_preset` | 一键套用配色预设（清新蓝 / 暖阳橙 / 莫兰迪绿） |
 | `set_hyperlink` | 给节点添加 / 移除超链接 |
+| `add_image` | 给节点插入本地图片 |
+| `add_summary` | 给连续子节点区间添加概要 |
+| `add_boundary` | 给连续子节点区间添加边界 |
+| `add_relationship` / `remove_relationship` | 添加 / 删除关系线 |
+| `remove_boundary` | 删除边界 |
 | `add_marker` / `remove_marker` | 添加 / 移除优先级、任务进度等图标 |
 | `add_label` / `remove_label` | 添加 / 移除标签 |
 
@@ -256,6 +274,36 @@ xmind-mcp
 3. `add_marker` 添加 `priority-1` 图标
 4. `save_file` 保存
 
+### 例 5：从 Markdown 新建一份思维导图
+
+> 把下面这份大纲转成 `D:\\docs\\新笔记.xmind`：
+> ```
+> # Python 学习路线
+> - 基础语法
+>   - 变量与类型
+> - 常用库
+> ```
+
+模型会调用 `import_markdown`，一步生成 XMind 文件。
+
+### 例 6：批量美化 + 体检
+
+> 分析 `D:\\docs\\操作系统.xmind`，把标题含"重点"的节点全部标红加粗并加优先级图标，然后告诉我有没有重复标题或空节点。
+
+模型会调用：
+
+1. `analyze_file` 先体检
+2. `apply_to_matching` 批量设置样式和标记（可 `auto_save=true`）
+3. 保存
+
+### 例 7：结构化视觉元素
+
+> 把 `D:\\docs\\操作系统.xmind` 的"进程"和"线程"加一个概要，给"重点章节"加边界，
+> 并在"进程"和"内存"之间画一条关系线，最后套用"清新蓝"配色。
+
+模型会调用 `add_summary`、`add_boundary`、`add_relationship`、`apply_style_preset`，
+这些都是 XMind 原生视觉元素，可以在 XMind 里继续调整。
+
 ---
 
 ## ⚙️ 命令行参数
@@ -281,7 +329,7 @@ xmind-mcp --setup --engine paddleocr
 xmind-mcp --uninstall
 ```
 
-会依次卸载已安装的 OCR 依赖、删除模型缓存和配置文件，并询问是否同时卸载本包 `xmind-mcp-server`。
+会依次卸载已安装的 OCR 依赖、删除本地数据（配置、OCR 缓存、自动备份），并询问是否同时卸载本包 `xmind-mcp-server`。
 
 ---
 
@@ -291,7 +339,7 @@ xmind-mcp --uninstall
 |----------|------|
 | `~/.xmind-mcp/config.json` | 硬件检测结果、OCR 引擎、推理设备配置 |
 | `~/.xmind-mcp/ocr_cache.db` | OCR 结果缓存，避免同一张图重复识别 |
-| `~/.xmind-mcp/models/` | OCR 模型下载缓存 |
+| `~/.xmind-mcp/backups/` | 覆盖保存前的自动备份（每个文件保留最近 20 份） |
 
 > MCP 关闭时会自动释放 OCR 模型占用的内存 / 显存。
 

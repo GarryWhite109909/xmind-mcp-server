@@ -15,16 +15,19 @@ import shutil
 import subprocess
 import sys
 from dataclasses import asdict
+from typing import Optional
 
 from .config import Config, CONFIG_FILE, CONFIG_DIR
 from .hardware import (
     detect_hardware,
     choose_packages,
+    cuda_runtime_available,
     install_packages,
     uninstall_packages,
     verify_installed,
     cleanup_onnxruntime_conflicts,
 )
+from .hardware.detector import has_nvidia_gpu
 
 
 def main() -> int:
@@ -41,7 +44,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--device",
-        choices=["cuda", "directml", "openvino", "rocm", "cpu"],
+        choices=["cuda", "directml", "cpu"],
         help="强制指定推理设备（默认自动检测）",
     )
     parser.add_argument(
@@ -71,8 +74,17 @@ def main() -> int:
     ok, msg = verify_installed(config.ocr_engine, config.device)
     if not ok:
         print(f"⚠️  OCR 引擎验证失败: {msg}", file=sys.stderr)
-        print("请运行 xmind-mcp --setup 重新配置。", file=sys.stderr)
-        return 1
+        # 设备不可用（如 CUDA 库缺失）但引擎本身能跑时，自动回退 CPU 并修正配置，
+        # 避免 MCP 客户端因为配置过时而无法启动。
+        fallback_ok, fallback_msg = verify_installed(config.ocr_engine, "cpu")
+        if fallback_ok:
+            print(f"⚠️  设备配置不可用，已自动回退 CPU: {fallback_msg}", file=sys.stderr)
+            config.device = "cpu"
+            config.save()
+            msg = fallback_msg
+        else:
+            print("请运行 xmind-mcp --setup 重新配置。", file=sys.stderr)
+            return 1
     print(f"✅ OCR 就绪: {msg}", file=sys.stderr)
 
     # 启动 MCP Server
@@ -98,6 +110,20 @@ def run_setup(config: Config, engine: str = "rapidocr", force_device: str = None
 
     # 选择包
     device, packages = choose_packages(hw, engine=engine)
+    if (
+        engine == "rapidocr"
+        and not force_device
+        and has_nvidia_gpu(hw)
+        and device == "cpu"
+        and not cuda_runtime_available()
+    ):
+        print(
+            "⚠️  检测到 NVIDIA 显卡，但没找到 CUDA 运行库（cudart64*.dll），"
+            "将直接使用 CPU。\n"
+            "    如需 GPU 加速，请先安装与 onnxruntime 匹配的 CUDA，"
+            "再运行 xmind-mcp --setup --device cuda。",
+            file=sys.stderr,
+        )
     if force_device:
         device = force_device
         # 根据 device 调整 packages
@@ -108,6 +134,10 @@ def run_setup(config: Config, engine: str = "rapidocr", force_device: str = None
                 "cpu": "onnxruntime",
             }.get(device, "onnxruntime")
             packages = ["rapidocr-onnxruntime", ort_pkg]
+        elif device == "cuda":
+            packages = ["paddleocr", "paddlepaddle-gpu"]
+        else:
+            packages = ["paddleocr", "paddlepaddle"]
 
     print(f"\n📦 OCR 引擎: {engine}", file=sys.stderr)
     print(f"   推理设备: {device}", file=sys.stderr)
@@ -127,8 +157,27 @@ def run_setup(config: Config, engine: str = "rapidocr", force_device: str = None
     # 验证
     ok, msg = verify_installed(engine, device)
     if not ok:
-        print(f"❌ 安装后验证失败: {msg}", file=sys.stderr)
-        return False
+        # 自动回退：GPU 依赖装好但用不了（缺 CUDA 运行库等）时，
+        # 自动改装 CPU 版并继续，让不同配置的用户都能直接用起来。
+        fallback_packages: Optional[list[str]] = None
+        if engine == "rapidocr" and device != "cpu":
+            print("⚠️  GPU 验证失败，正在自动回退 CPU ...", file=sys.stderr)
+            cleanup_onnxruntime_conflicts("cpu")
+            fallback_packages = ["rapidocr-onnxruntime", "onnxruntime"]
+        elif engine == "paddleocr" and device == "cuda":
+            print("⚠️  CUDA 版 Paddle 验证失败，正在自动回退 CPU ...", file=sys.stderr)
+            fallback_packages = ["paddleocr", "paddlepaddle"]
+
+        if fallback_packages and install_packages(fallback_packages):
+            fallback_ok, fallback_msg = verify_installed(engine, "cpu")
+            if fallback_ok:
+                device = "cpu"
+                packages = fallback_packages
+                ok = True
+                msg = fallback_msg
+        if not ok:
+            print(f"❌ 安装后验证失败: {msg}", file=sys.stderr)
+            return False
 
     # 写配置
     config.ocr_engine = engine
@@ -137,7 +186,6 @@ def run_setup(config: Config, engine: str = "rapidocr", force_device: str = None
     config.cpu_count = hw.cpu_count
     config.ram_gb = hw.ram_gb
     config.os = hw.os
-    config.model_cache_dir = str(__import__("pathlib").Path.home() / ".xmind-mcp" / "models")
     config.initialized = True
     config.installed_packages = packages
     config.save()
@@ -176,7 +224,7 @@ def run_uninstall(config: Config) -> int:
         print(f"🗑️  删除本地数据目录: {CONFIG_DIR}")
         try:
             shutil.rmtree(CONFIG_DIR)
-            print("   ✅ 已删除（含 OCR 模型缓存、配置、SQLite 缓存）")
+            print("   ✅ 已删除（含配置、OCR 缓存、自动备份）")
         except Exception as e:
             print(f"   ⚠️ 删除失败: {e}，请手动删除 {CONFIG_DIR}")
 
