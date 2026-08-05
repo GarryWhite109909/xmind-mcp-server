@@ -5,16 +5,22 @@
   xmind-mcp --setup      # 重新检测硬件并配置
   xmind-mcp --info       # 打印当前硬件和配置信息
   xmind-mcp --engine paddleocr   # 切换 OCR 引擎
+  xmind-mcp --uninstall  # 一键卸载（依赖 + 模型 + 配置 + 可选本体）
+  xmind-mcp --uninstall --yes    # 全自动卸载（含本体，跳过确认）
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from dataclasses import asdict
+from pathlib import Path
 from typing import Optional
 
 from .config import Config, CONFIG_FILE, CONFIG_DIR
@@ -32,6 +38,7 @@ from .hardware.detector import has_nvidia_gpu
 
 
 def main() -> int:
+    _fix_console_encoding()
     parser = argparse.ArgumentParser(
         prog="xmind-mcp",
         description="XMind MCP Server — 让大模型读写 XMind 文件",
@@ -53,13 +60,19 @@ def main() -> int:
         action="store_true",
         help="一键卸载：卸载 OCR 依赖、删除模型缓存和配置，可选择同时卸载本包",
     )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="全自动：跳过所有确认（含卸载本包）",
+    )
     args = parser.parse_args()
 
     config = Config.load()
 
     # --uninstall：清理所有依赖和本地数据
     if args.uninstall:
-        return run_uninstall(config)
+        return run_uninstall(config, yes=args.yes)
 
     # --info：只打印信息，不启动
     if args.info:
@@ -240,59 +253,214 @@ def run_setup(config: Config, engine: str = "rapidocr", force_device: str = None
     return True
 
 
-def run_uninstall(config: Config) -> int:
-    """一键卸载：卸载 OCR 依赖 + 删除模型缓存 + 删除配置 + 可选卸载本包。"""
-    print("🧹 开始卸载 XMind MCP Server ...\n")
+def _fix_console_encoding() -> None:
+    """中文 Windows（GBK 控制台/管道）下保证 emoji 等符号可正常输出。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
-    # 1. 卸载 OCR 依赖
-    packages = list(config.installed_packages)
-    # 额外清理可能存在的 onnxruntime 变体
-    variants = ["onnxruntime", "onnxruntime-gpu", "onnxruntime-directml"]
-    for v in variants:
-        if v not in packages:
-            packages.append(v)
-    if config.ocr_engine == "paddleocr":
-        packages += ["paddlepaddle", "paddlepaddle-gpu"]
-    pkgs = [p for p in packages if p]
+
+# 卸载时按固定名单探测，不依赖配置文件（配置缺失/损坏/旧版本也能卸干净）
+_OCR_DEP_PATTERNS = [
+    "rapidocr-onnxruntime",
+    "paddleocr",
+    "paddlepaddle",
+    "paddlepaddle-gpu",
+    "onnxruntime",
+    "onnxruntime-gpu",
+    "onnxruntime-directml",
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cudnn-cu12",
+    "nvidia-cublas-cu12",
+    "nvidia-cudart-cu12",
+]
+
+# 卸载本包时一并清理的直接依赖（与 OCR 无关，确认后会提示可能影响其他项目）
+_PACKAGE_DIRECT_DEPS = ["mcp", "psutil", "Pillow"]
+
+# OCR 模型默认缓存目录（RapidOCR / PaddleOCR）
+_OCR_CACHE_DIRS = [
+    Path.home() / ".cache" / "rapidocr",
+    Path.home() / ".cache" / "rapidocr_onnxruntime",
+    Path.home() / ".paddleocr",
+]
+
+
+def _installed_packages() -> set[str]:
+    """探测当前 Python 环境已安装的包名（pip list --format=freeze）。"""
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "list", "--format=freeze"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return set()
+    names = set()
+    for line in r.stdout.splitlines():
+        name = line.split("==")[0].strip().replace("_", "-").lower()
+        if name:
+            names.add(name)
+    return names
+
+
+def _find_server_pids() -> list[int]:
+    """查找命令行中包含 xmind_mcp 的进程（排除自身），用于卸载前停止服务。"""
+    own = os.getpid()
+    pids: list[int] = []
+    try:
+        if sys.platform == "win32":
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'xmind_mcp' } | Select-Object -ExpandProperty ProcessId"],
+                capture_output=True, text=True, timeout=30,
+            )
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if line.isdigit() and int(line) != own:
+                    pids.append(int(line))
+        else:
+            r = subprocess.run(
+                ["ps", "-eo", "pid=,args="],
+                capture_output=True, text=True, timeout=30,
+            )
+            for line in r.stdout.splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) == 2 and "xmind_mcp" in parts[1]:
+                    pid = int(parts[0])
+                    if pid != own:
+                        pids.append(pid)
+    except Exception:
+        return []
+    return list(dict.fromkeys(pids))
+
+
+def _stop_running_server(yes: bool) -> None:
+    """卸载前尝试停止正在运行的 XMind MCP Server（避免数据目录被占用）。"""
+    pids = _find_server_pids()
+    if not pids:
+        return
+    print(f"⚠️  检测到可能正在运行的 XMind MCP Server 进程: {', '.join(str(p) for p in pids)}")
+    if not yes:
+        try:
+            ans = input("是否先停止这些进程？[y/N]: ").strip().lower()
+        except EOFError:
+            ans = "n"
+        if ans not in ("y", "yes"):
+            print("   跳过停止进程，继续尝试删除数据目录（可能因占用失败）...")
+            return
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                   capture_output=True, timeout=15)
+                else:
+                    subprocess.run(["kill", "-9", str(pid)],
+                                   capture_output=True, timeout=15)
+            except Exception:
+                pass
+    time.sleep(1.5)
+
+
+def run_uninstall(config: Config, yes: bool = False) -> int:
+    """一键卸载：卸载依赖 + 停止服务 + 删除本地数据/模型缓存 + 可选卸载本包。"""
+    print("🧹 开始卸载 XMind MCP Server ...\n")
+    failures: list[str] = []
+    installed = _installed_packages()
+
+    # 1. 卸载 OCR / 运行时依赖：配置文件记录的 + 固定名单中已安装的
+    pkgs: list[str] = []
+    for p in list(config.installed_packages) + _OCR_DEP_PATTERNS:
+        key = p.replace("_", "-").lower()
+        if key in installed and p not in pkgs:
+            pkgs.append(p)
 
     if pkgs:
-        print(f"⬇️  卸载 OCR 依赖: {', '.join(pkgs)}")
+        print(f"⬇️  卸载 OCR/运行时依赖: {', '.join(pkgs)}")
         if uninstall_packages(pkgs):
             print("   ✅ 依赖已卸载")
         else:
+            failures.append("OCR/运行时依赖卸载未完全成功")
             print("   ⚠️ 部分依赖卸载失败，可手动执行: pip uninstall -y " + " ".join(pkgs))
     else:
-        print("   （未检测到已安装的 OCR 依赖）")
+        print("   （当前环境未检测到已安装的 OCR/运行时依赖）")
 
-    # 2. 删除模型缓存和配置目录
+    # 2. 停止可能正在运行的服务，避免数据目录被占用
+    _stop_running_server(yes)
+
+    # 3. 删除配置 / OCR 缓存 / 自动备份
     if CONFIG_DIR.exists():
         print(f"🗑️  删除本地数据目录: {CONFIG_DIR}")
         try:
             shutil.rmtree(CONFIG_DIR)
             print("   ✅ 已删除（含配置、OCR 缓存、自动备份）")
         except Exception as e:
+            failures.append(f"本地数据目录删除失败: {CONFIG_DIR}")
             print(f"   ⚠️ 删除失败: {e}，请手动删除 {CONFIG_DIR}")
+    else:
+        print("   （未发现本地数据目录）")
 
-    # 3. 可选卸载本包
-    print("\n是否同时卸载本包 xmind-mcp-server ？(y/n)")
-    try:
-        answer = input().strip().lower()
-    except EOFError:
-        answer = "n"
-    if answer in ("y", "yes"):
-        print("⬇️  卸载本包 xmind-mcp-server ...")
+    # 4. 删除 OCR 模型缓存（RapidOCR / PaddleOCR 默认目录，在 ~/.xmind-mcp 之外）
+    for cache_dir in _OCR_CACHE_DIRS:
+        if cache_dir.exists():
+            print(f"🗑️  删除 OCR 模型缓存: {cache_dir}")
+            try:
+                shutil.rmtree(cache_dir)
+                print("   ✅ 已删除")
+            except Exception as e:
+                failures.append(f"OCR 模型缓存删除失败: {cache_dir}")
+                print(f"   ⚠️ 删除失败: {e}，请手动删除 {cache_dir}")
+
+    # 5. 可选卸载本包及其直接依赖
+    keep_pkg = False
+    if yes:
+        answer = "y"
+    else:
+        print("\n是否同时卸载本包 xmind-mcp-server 及其直接依赖（mcp、psutil、Pillow）？(y/n)")
         try:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "uninstall", "-y", "xmind-mcp-server"],
-                check=False,
+            answer = input().strip().lower()
+        except EOFError:
+            answer = "n"
+    if answer in ("y", "yes"):
+        remove_pkgs = ["xmind-mcp-server"]
+        remove_pkgs += [
+            p for p in _PACKAGE_DIRECT_DEPS
+            if p.replace("_", "-").lower() in installed
+        ]
+        print(f"⬇️  卸载本包及直接依赖: {', '.join(remove_pkgs)}")
+        try:
+            r = subprocess.run(
+                [sys.executable, "-m", "pip", "uninstall", "-y", *remove_pkgs],
+                check=False, timeout=300,
             )
-            print("   ✅ 本包已卸载")
+            if r.returncode == 0:
+                print("   ✅ 已卸载")
+            else:
+                failures.append("本包/直接依赖卸载失败")
+                print("   ⚠️ 卸载失败，可手动执行: pip uninstall -y " + " ".join(remove_pkgs))
         except Exception as e:
+            failures.append("本包/直接依赖卸载异常")
             print(f"   ⚠️ 本包卸载失败: {e}")
     else:
+        keep_pkg = True
         print("   保留本包（如需完全卸载，可运行: pip uninstall xmind-mcp-server）")
 
-    print("\n🎉 卸载完成。")
+    # 6. 汇总
+    print()
+    if failures:
+        print("⚠️ 部分步骤未成功：")
+        for f in failures:
+            print(f"  - {f}")
+        print("请按上方提示手动处理。")
+        return 1
+    if keep_pkg:
+        print("🎉 卸载完成（已保留本包；如需完全卸载：pip uninstall xmind-mcp-server）")
+    else:
+        print("🎉 卸载完成，所有内容已清理。")
     return 0
 
 

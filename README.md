@@ -342,7 +342,8 @@ xmind-mcp --setup            # 重新检测硬件并配置
 xmind-mcp --info             # 打印当前硬件和配置信息
 xmind-mcp --engine rapidocr  # 指定 OCR 引擎
 xmind-mcp --device cuda      # 强制指定推理设备
-xmind-mcp --uninstall        # 一键卸载（依赖 + 模型 + 配置 + 本体）
+xmind-mcp --uninstall        # 一键卸载（依赖 + 模型 + 配置 + 可选本体）
+xmind-mcp --uninstall --yes  # 全自动卸载（含本体，跳过所有确认）
 ```
 
 切换 OCR 引擎：
@@ -355,9 +356,18 @@ xmind-mcp --setup --engine paddleocr
 
 ```bash
 xmind-mcp --uninstall
+xmind-mcp --uninstall --yes   # 全自动：连本包一起卸载，不询问
 ```
 
-会依次卸载已安装的 OCR 依赖、删除本地数据（配置、OCR 缓存、自动备份），并询问是否同时卸载本包 `xmind-mcp-server`。
+卸载流程（按实际检测结果动态执行）：
+
+1. 卸载当前 Python 环境中已安装的 OCR/运行时依赖（rapidocr-onnxruntime、paddleocr、onnxruntime 各变体、`nvidia-*-cu12` CUDA 运行库等；不依赖配置文件，配置缺失/损坏也能识别）；
+2. 停止正在运行的 XMind MCP Server（避免数据目录被占用，交互模式下会先询问）；
+3. 删除本地数据目录 `~/.xmind-mcp`（配置、OCR 缓存、自动备份）；
+4. 删除 OCR 模型缓存（`~/.cache/rapidocr`、`~/.cache/rapidocr_onnxruntime`、`~/.paddleocr`）；
+5. 询问（或 `--yes` 直接执行）是否同时卸载本包 `xmind-mcp-server` 及其直接依赖 `mcp`、`psutil`、`Pillow`——这些是通用库，可能被其他项目使用，请确认后再删。
+
+卸载失败时退出码非 0，并列出未成功的步骤；非交互环境（无终端输入）默认保留本包，可用 `--yes` 全自动卸载。
 
 ***
 
