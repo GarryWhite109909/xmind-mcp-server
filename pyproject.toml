@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xmind-mcp-server"
-version = "0.2.8"
+version = "0.2.9"
 description = "让大模型读写 XMind 文件，支持图片 OCR 的 MCP Server"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
-    {name = "GarryWhite", email = "garrywhite@example.com"},
+    {name = "GarryWhite109909", email = "3284263390@qq.com"},
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
