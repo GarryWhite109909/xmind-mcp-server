@@ -64,6 +64,12 @@ XMind MCP Server 是一个基于 [Model Context Protocol (MCP)](https://modelcon
 `content.json`，再安全重组 ZIP。**覆盖保存原文件前会自动备份到
 `~/.xmind-mcp/backups/`（每个文件保留最近 20 份）**，模型改坏了也能找回。
 
+### 6. Markdown 公式自动渲染
+
+从 Markdown 导入时，自动识别块级 `$$...$$` 数学公式，用 matplotlib 渲染成图片
+插入对应节点——**免费版 XMind 也能显示公式**，不再是一串乱码 LaTeX 文本。
+行内公式 `$...$` 保持为文本；mathtext 渲染不了的公式会原样保留，不报错不中断。
+
 ***
 
 ## 🆚 与纯 Python 脚本对比
@@ -87,7 +93,8 @@ XMind MCP Server 是一个基于 [Model Context Protocol (MCP)](https://modelcon
 pip install xmind-mcp-server
 ```
 
-RapidOCR + onnxruntime 已作为**必装依赖**内置，安装后即具备 OCR 能力（首次启动只需联网下载 OCR 模型）。
+RapidOCR + onnxruntime（OCR）和 matplotlib（Markdown 公式渲染）已作为**必装依赖**内置，
+安装后即具备 OCR 与公式导入能力（首次启动只需联网下载 OCR 模型）。
 
 可选安装 PaddleOCR 引擎（需更大依赖）：
 
