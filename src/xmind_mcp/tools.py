@@ -1607,12 +1607,13 @@ class XMindTools:
     async def _import_markdown(self, args: dict) -> str:
         file_path = args["file_path"]
         markdown = args["markdown"]
-        root_title, topics = _parse_markdown_outline(markdown)
+        root_title, topics, root_meta = _parse_markdown_outline(markdown)
         writer = XMindWriter.create(
             file_path,
             root_title,
             sheet_title=args.get("sheet_title", root_title or "画布 1"),
             topics=topics,
+            root_meta=root_meta,
         )
         xm = writer.xm
         self.workspace._cache[os.path.abspath(file_path)] = (
@@ -1638,12 +1639,13 @@ class XMindTools:
         if not markdown:
             raise ValueError(f"无法读取 Markdown 文件（不是 UTF-8 或 GBK 编码）: {md_path}")
 
-        root_title, topics = _parse_markdown_outline(markdown)
+        root_title, topics, root_meta = _parse_markdown_outline(markdown)
         writer = XMindWriter.create(
             output_path,
             root_title,
             sheet_title=args.get("sheet_title", root_title or "画布 1"),
             topics=topics,
+            root_meta=root_meta,
         )
         xm = writer.xm
         self.workspace._cache[os.path.abspath(output_path)] = (
@@ -2149,76 +2151,246 @@ def _export_node_md(node: TopicNode, depth: int, lines: list[str], include_ids: 
         _export_node_md(child, depth + 1, lines, include_ids)
 
 
-def _parse_markdown_outline(markdown: str) -> tuple[str, list[dict]]:
-    """把 Markdown 逐行原样解析成 create_file 用的嵌套结构。
+def _strip_inline_markup(text: str) -> tuple[str, bool, bool]:
+    """去掉行内的加粗/斜体标记，返回 (干净文本, 是否加粗, 是否斜体)。
 
-    这是“原封不动”模式：除了去掉标题/列表/引用/围栏代码的标记符号外，
-    所有文字（表格行、代码块内容、行内格式）都会保留，不做概括或精简。
-    纯分隔线（--- / *** / ___）不产生节点。
-
-    层级规则：
-    - 文档只有一个顶层条目（通常是唯一的 # 标题）时，它作为中心主题；
-    - 有多个顶层条目（平铺列表、多个 # 标题）时，自动加一个“未命名”
-      中心主题，所有顶层条目作为它的分支，避免把兄弟条目错挂成父子。
+    支持 **粗体** / __粗体__ / *斜体* / ***粗斜体***；
+    代码块内容不会走到这里（由调用方用 kind="fence" 跳过）。
     """
-    items: list[tuple[int, str]] = []
+    bold = False
+    italic = False
+
+    def _bold_italic(m: re.Match) -> str:
+        nonlocal bold, italic
+        bold = True
+        italic = True
+        return m.group(1)
+
+    def _bold(m: re.Match) -> str:
+        nonlocal bold
+        bold = True
+        return m.group(1)
+
+    def _italic(m: re.Match) -> str:
+        nonlocal italic
+        italic = True
+        return m.group(1)
+
+    text = re.sub(r"\*\*\*(.+?)\*\*\*", _bold_italic, text, flags=re.S)
+    text = re.sub(r"\*\*(.+?)\*\*", _bold, text, flags=re.S)
+    text = re.sub(r"__(.+?)__", _bold, text, flags=re.S)
+    text = re.sub(r"\*([^*]+?)\*", _italic, text, flags=re.S)
+    return text.strip(), bold, italic
+
+
+def _split_table_row(line: str) -> list[str]:
+    """拆分表格行，忽略最外层管道符，去掉单元格首尾空格。"""
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|") and not line.endswith("\\|"):
+        line = line[:-1]
+    return [cell.strip() for cell in line.split("|")]
+
+
+def _is_table_separator(line: str) -> bool:
+    """判断是否为 markdown 表格分隔行（如 |---|---|）。"""
+    if "|" not in line:
+        return False
+    cells = _split_table_row(line)
+    return bool(cells) and all(
+        re.fullmatch(r":?-{1,}:?", cell.replace(" ", ""))
+        for cell in cells
+    )
+
+
+def _parse_table_block(lines: list[str]) -> dict:
+    """把连续表格行解析成 XMind 风格的行节点 + 单元格子节点。
+
+    与 XMind 软件导入保持一致：
+    - 行节点标题 = 第一列内容；
+    - 子节点 = 其余列内容，labels = 对应列的表头（帮助模型/用户识别列含义）。
+    返回 {"header": 表头单元格列表, "rows": 行节点列表}。
+    """
+    header = _split_table_row(lines[0])
+    rows: list[dict] = []
+    for line in lines[2:]:
+        cells = _split_table_row(line)
+        if not cells:
+            continue
+        row: dict = {"title": cells[0], "children": []}
+        for col in range(1, len(cells)):
+            child: dict = {"title": cells[col], "children": []}
+            if col < len(header) and header[col]:
+                child["labels"] = [header[col]]
+            row["children"].append(child)
+        rows.append(row)
+    return {"header": header, "rows": rows}
+
+
+def _apply_table_meta(parent: dict, header: list[str]) -> None:
+    """把父节点标记成 XMind 原生电子表格结构。
+
+    只有 structureClass + 列定义扩展，XMind 才会把这一支渲染成真正的
+    表格（spreadsheet），否则只是普通的“一堆分支”。
+    """
+    if not header:
+        return
+    parent["structureClass"] = "org.xmind.ui.spreadsheet"
+    columns = [{"name": "leading-column", "content": header[0]}] + [
+        {"name": "column", "content": cell}
+        for cell in header[1:]
+        if cell
+    ]
+    parent["extensions"] = [{
+        "provider": "org.xmind.ui.spreadsheet",
+        "content": [{"name": "columns", "content": columns}],
+    }]
+
+
+def _parse_markdown_outline(markdown: str) -> tuple[str, list[dict], dict]:
+    """把 Markdown 解析成 create_file 用的嵌套结构。
+
+    处理规则（对齐 XMind 软件导入行为）：
+    - 标题/列表：按层级挂树，行首的 **加粗** 不再被误当成列表符号吞掉；
+    - 行内 **加粗** / *斜体*：去掉标记，并把样式写进节点（fo:font-weight/italic）；
+    - 表格（表头 + 分隔行 + 数据行）：行节点 + 单元格子节点，单元格带上列名标签；
+    - 引用块（> 开头）：变成“前一个节点”的备注；
+    - 代码块内容原样保留，不做行内解析；
+    - 纯分隔线（--- / *** / ___）不产生节点。
+    """
+    items: list[dict] = []
     in_fence = False
     current_heading = 0
-    for raw_line in markdown.splitlines():
+    lines = markdown.splitlines()
+    i = 0
+    while i < len(lines):
+        raw_line = lines[i]
         stripped_line = raw_line.strip()
         if stripped_line.startswith("```"):
             in_fence = not in_fence
-            continue  # 围栏标记本身不保留，里面的内容保留
+            i += 1
+            continue
         if not stripped_line:
+            i += 1
             continue
         # 纯分隔线不是内容，跳过
         if not in_fence and re.fullmatch(r"[-*_]{3,}", stripped_line):
+            i += 1
             continue
 
         indent = len(raw_line) - len(raw_line.lstrip())
         if in_fence:
-            # 代码块内容：原样保留，挂在最近的标题/列表下面
+            # 代码块内容：原样保留，不做行内解析
             base = current_heading + 1 if current_heading else 0
-            items.append((base + indent // 2, stripped_line))
-        elif stripped_line.startswith("#"):
+            items.append({"level": base + indent // 2, "text": stripped_line, "kind": "fence"})
+            i += 1
+            continue
+        if stripped_line.startswith("#"):
             heading = stripped_line.lstrip("#")
             level = len(stripped_line) - len(heading)
-            text = heading.strip()
             current_heading = level
-            items.append((level, text))
-        else:
-            # 去掉行首的列表符号和引用符号，保留其余原文
-            text = re.sub(r"^(?:[-*+>]\s*)+", "", stripped_line).strip()
-            # 列表行挂在“最近的标题”下面；没有标题时第一行列表就是根
+            items.append({"level": level, "text": heading.strip(), "kind": "text"})
+            i += 1
+            continue
+        # 表格：当前行像表头，且下一行是分隔行
+        if (
+            "|" in stripped_line
+            and i + 1 < len(lines)
+            and _is_table_separator(lines[i + 1].strip())
+        ):
+            block = [stripped_line]
+            # 从分隔行开始收集（分隔行也是表格的一部分，_parse_table_block 需要它）
+            j = i + 1
+            while j < len(lines):
+                next_line = lines[j].strip()
+                if "|" in next_line:
+                    block.append(next_line)
+                    j += 1
+                else:
+                    break
             base = current_heading + 1 if current_heading else 0
-            items.append((base + indent // 2, text))
+            parsed = _parse_table_block(block)
+            for row_index, row in enumerate(parsed["rows"]):
+                item: dict = {"level": base + indent // 2, "kind": "topic", "topic": row}
+                if row_index == 0:
+                    item["table_meta"] = parsed["header"]
+                items.append(item)
+            i = j
+            continue
+        if stripped_line.startswith(">"):
+            # 引用块 → 前一个节点的备注
+            note_text, _, _ = _strip_inline_markup(stripped_line.lstrip(">").strip())
+            items.append({"kind": "note", "text": note_text})
+            i += 1
+            continue
+        # 列表/普通文本：只认“符号 + 空格”的列表标记，
+        # 避免把行首 **加粗** 当成 * 列表符号吃掉
+        text = re.sub(r"^(?:[-+>]\s+|[-*+]\s+)+", "", stripped_line).strip()
+        base = current_heading + 1 if current_heading else 0
+        items.append({"level": base + indent // 2, "text": text, "kind": "text"})
+        i += 1
 
     if not items:
         raise ValueError("Markdown 内容为空，无法创建文件")
 
     # 整体归一化：最小层级变成 1
-    min_level = min(level for level, _ in items)
-    normalized = [(max(level - min_level + 1, 1), text) for level, text in items]
+    min_level = min(item["level"] for item in items if item.get("level") is not None)
 
     # 先挂到虚拟根上：标准大纲算法，层级跳变时自动成为上层节点的子节点
     virtual: dict = {"title": "", "children": []}
     stack: list[tuple[int, dict]] = [(0, virtual)]
-    for level, text in normalized:
+    last_topic: Optional[dict] = None
+    for item in items:
+        if item["kind"] == "note":
+            if last_topic is not None:
+                existing = last_topic.get("notes") or ""
+                last_topic["notes"] = (existing + "\n" if existing else "") + item["text"]
+                # 引用块转成的备注要直接显示在画布上（XMind 的 notesDisplay: block）
+                last_topic["notesDisplay"] = "block"
+            else:
+                # 没有前置节点时兜底成普通节点
+                note_node: dict = {"title": item["text"], "children": []}
+                virtual["children"].append(note_node)
+                last_topic = note_node
+            continue
+
+        level = max(item["level"] - min_level + 1, 1)
         while len(stack) > 1 and level <= stack[-1][0]:
             stack.pop()
         parent = stack[-1][1]
-        child: dict = {"title": text, "children": []}
+        if item["kind"] == "topic":
+            child = item["topic"]
+            table_header = item.get("table_meta")
+            if table_header:
+                _apply_table_meta(parent, table_header)
+        else:
+            text, bold, italic = _strip_inline_markup(item["text"])
+            child = {"title": text, "children": []}
+            if bold or italic:
+                props: dict[str, str] = {}
+                if bold:
+                    props["fo:font-weight"] = "bold"
+                if italic:
+                    props["fo:font-style"] = "italic"
+                child["style"] = {"properties": props}
         parent["children"].append(child)
         stack.append((level, child))
+        last_topic = child
 
     top_level = virtual["children"]
     if len(top_level) == 1:
         # 只有一个顶层条目（典型：# 根主题 + 各层子节点），它就是中心主题
         real_root = top_level[0]
-        return real_root["title"], real_root["children"]
+        root_meta = {
+            key: real_root[key]
+            for key in ("structureClass", "extensions", "notesDisplay", "style")
+            if real_root.get(key)
+        }
+        return real_root["title"], real_root["children"], root_meta
     # 多个顶层条目（平铺列表 / 多个 # 标题）→ 自动加“未命名”中心主题，
     # 所有顶层条目保持兄弟关系，不被错误嵌套
-    return "未命名", top_level
+    return "未命名", top_level, {}
 
 
 def _build_svg(xm: XMindFile) -> tuple[str, dict]:

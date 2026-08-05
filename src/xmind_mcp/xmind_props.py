@@ -132,8 +132,10 @@ STRUCTURES: dict[str, str] = {
     "树形图": "org.xmind.ui.tree.right",
     "时间轴": "org.xmind.ui.timeline.horizontal",
     "鱼骨图": "org.xmind.ui.fishbone.rightHeaded",
-    "矩阵图": "org.xmind.ui.grid",
-    "树型表格": "org.xmind.ui.treetable",
+    # 实测 XMind 26：矩阵图/电子表格用的是 spreadsheet 结构（需要列扩展），
+    # 树型表格用的是 treetable.toptitle（不需要扩展）
+    "矩阵图": "org.xmind.ui.spreadsheet",
+    "树型表格": "org.xmind.ui.treetable.toptitle",
 }
 
 # 分支连线类型 → line-class
@@ -244,14 +246,21 @@ def resolve_text_decoration(value: object) -> Optional[str]:
         return None
     if text in TEXT_DECORATIONS:
         return TEXT_DECORATIONS[text]
+    if text in TEXT_DECORATIONS.values():
+        # 直接接受英文值：underline / line-through / none
+        return text
     parts = []
     for part in re.split(r"[\s+、,，]+", text):
         part = part.strip()
         if not part:
             continue
-        if part not in TEXT_DECORATIONS:
-            raise ValueError(f"文字装饰不支持「{part}」，可选: {'、'.join(TEXT_DECORATIONS)}")
-        resolved = TEXT_DECORATIONS[part]
+        resolved = TEXT_DECORATIONS.get(part)
+        if resolved is None and part in TEXT_DECORATIONS.values():
+            resolved = part
+        if resolved is None:
+            raise ValueError(
+                f"文字装饰不支持「{part}」，可选: {'、'.join(TEXT_DECORATIONS)}"
+            )
         if resolved != "none" and resolved not in parts:
             parts.append(resolved)
     return " ".join(parts) if parts else "none"

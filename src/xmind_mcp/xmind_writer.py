@@ -301,6 +301,17 @@ def _set_notes(topic_dict: dict, notes: str) -> None:
     topic_dict["notes"] = {"plain": {"content": notes}}
 
 
+def _notes_real_html(text: str) -> str:
+    """生成 XMind 画布显式备注用的 realHTML 内容。"""
+    escaped = (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    return "<div>" + escaped.replace("\n", "<br>") + "</div>"
+
+
 def _raw_notes_text(topic_dict: dict) -> str:
     """从 raw topic dict 里取备注纯文本（兼容新版 text 与旧版 plain.content）。"""
     notes = topic_dict.get("notes")
@@ -820,13 +831,32 @@ class XMindWriter:
         sheet_index: int = 0,
         layout: str = "思维导图",
     ) -> bool:
-        """切换工作表根主题的布局结构（structureClass），支持中文名（逻辑图/括号图/时间轴等）。"""
+        """切换工作表根主题的布局结构，支持中文名（逻辑图/括号图/时间轴等）。
+
+        表格类布局（矩阵图/电子表格）除了 structureClass，还必须写
+        org.xmind.ui.spreadsheet 的列定义扩展，否则 XMind 只会渲染成
+        普通分支；切回非表格布局时要把旧扩展清掉，避免残留。
+        """
         if sheet_index < 0 or sheet_index >= len(self.xm.raw_content):
             return False
         root = self.xm.raw_content[sheet_index].get("rootTopic", {})
         if not root:
             return False
-        root["structureClass"] = resolve(STRUCTURES, layout, label="布局结构")
+        resolved = resolve(STRUCTURES, layout, label="布局结构")
+        root["structureClass"] = resolved
+        if resolved == "org.xmind.ui.spreadsheet":
+            root["extensions"] = [{
+                "provider": "org.xmind.ui.spreadsheet",
+                "content": [{
+                    "name": "columns",
+                    "content": [
+                        {"name": "column", "content": f"标签 {i}"}
+                        for i in range(1, 6)
+                    ] + [{"name": "leading-column", "content": ""}],
+                }],
+            }]
+        else:
+            root.pop("extensions", None)
         self.xm.refresh_from_raw()
         return True
 
@@ -1719,6 +1749,7 @@ class XMindWriter:
         *,
         sheet_title: str = "画布 1",
         topics: Optional[list[dict]] = None,
+        root_meta: Optional[dict] = None,
     ) -> "XMindWriter":
         """从零创建一个新的 XMind 文件。
 
@@ -1742,6 +1773,19 @@ class XMindWriter:
             notes = item.get("notes")
             if notes:
                 topic["notes"] = {"plain": {"content": notes}}
+                if item.get("notesDisplay"):
+                    topic["notesDisplay"] = item["notesDisplay"]
+                    topic["notes"]["realHTML"] = {"content": _notes_real_html(notes)}
+            labels = item.get("labels")
+            if labels:
+                topic["labels"] = list(labels)
+            style = item.get("style")
+            if isinstance(style, dict) and style.get("properties"):
+                topic["style"] = copy.deepcopy(style)
+            if item.get("structureClass"):
+                topic["structureClass"] = item["structureClass"]
+            if item.get("extensions"):
+                topic["extensions"] = copy.deepcopy(item["extensions"])
             children = item.get("children") or []
             topic["children"]["attached"] = [_build_topic(c) for c in children]
             return topic
@@ -1751,6 +1795,12 @@ class XMindWriter:
             root_title,
             [_build_topic(t) for t in (topics or [])],
         )
+        if root_meta:
+            # 根主题自身可能带表格结构/扩展/显式备注/加粗等元数据
+            root_topic = sheet["rootTopic"]
+            for key in ("structureClass", "extensions", "notesDisplay", "style"):
+                if root_meta.get(key):
+                    root_topic[key] = copy.deepcopy(root_meta[key])
         content = [sheet]
 
         zip_bytes = io.BytesIO()

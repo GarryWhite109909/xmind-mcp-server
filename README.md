@@ -1,6 +1,6 @@
 # XMind MCP Server
 
-> 让大模型真正“看懂”并“修改” XMind 思维导图的本地 MCP Server。
+> 让大模型真正“看懂”并“修改&美化” XMind 思维导图的本地 MCP Server。（用此mcp从md导入的文件不会有svg预览，因此会比软件导入轻量很多，但必要元素都能正确导入）
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)

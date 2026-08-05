@@ -161,7 +161,7 @@ def test_repair_non_zip_file_creates_valid_xmind(tmp_path: Path):
 
 def test_parse_markdown_flat_list_becomes_siblings():
     """平铺列表的兄弟条目不能错挂成父子。"""
-    root, topics = _parse_markdown_outline("- apple\n- banana\n- cherry\n")
+    root, topics, _ = _parse_markdown_outline("- apple\n- banana\n- cherry\n")
     assert root == "未命名"
     assert [t["title"] for t in topics] == ["apple", "banana", "cherry"]
     assert all(not t["children"] for t in topics)
@@ -169,9 +169,103 @@ def test_parse_markdown_flat_list_becomes_siblings():
 
 def test_parse_markdown_multiple_h1_becomes_siblings():
     """多个 # 一级标题应保持兄弟关系。"""
-    root, topics = _parse_markdown_outline("# A\n# B\n# C\n")
+    root, topics, _ = _parse_markdown_outline("# A\n# B\n# C\n")
     assert root == "未命名"
     assert [t["title"] for t in topics] == ["A", "B", "C"]
+
+
+def test_markdown_bold_stripped_and_styled():
+    """行内/行首 **加粗** 要去掉标记并写成加粗样式，不能残留 * 号。"""
+    root, topics, _ = _parse_markdown_outline(
+        "# 根\n"
+        "- **典型结构（Unix inode）**：\n"
+        "- 普通文字，含 **超级块** 加粗\n"
+        "- *斜体内容*\n"
+    )
+    a, b, c = topics
+    assert a["title"] == "典型结构（Unix inode）："
+    assert a["style"]["properties"]["fo:font-weight"] == "bold"
+    assert b["title"] == "普通文字，含 超级块 加粗"
+    assert b["style"]["properties"]["fo:font-weight"] == "bold"
+    assert c["title"] == "斜体内容"
+    assert c["style"]["properties"]["fo:font-style"] == "italic"
+    # 不能残留任何 * 号
+    def _all_titles(t):
+        yield t["title"]
+        for child in t.get("children") or []:
+            yield from _all_titles(child)
+    assert all("*" not in title for title in _all_titles({"title": root, "children": topics}))
+
+
+def test_markdown_table_structured_with_labels():
+    """表格要变成行节点 + 单元格子节点，单元格带列名标签。"""
+    root, topics, _ = _parse_markdown_outline(
+        "# 根\n"
+        "## 对比\n"
+        "| 结构 | 顺序访问 | 随机访问 | 碎片 | 增长 |\n"
+        "|------|---------|---------|------|------|\n"
+        "| 连续 | 快 | 快 | 外部 | 难 |\n"
+        "| 链接 | 快 | 慢 | 无 | 易 |\n"
+        "| 索引 | 中 | 快 | 无 | 易 |\n"
+    )
+    section = topics[0]
+    assert section["title"] == "对比"
+    # 父节点要标记成 XMind 原生电子表格结构，否则渲染成“一堆分支”
+    assert section["structureClass"] == "org.xmind.ui.spreadsheet"
+    columns = section["extensions"][0]["content"][0]["content"]
+    assert [c["content"] for c in columns] == ["结构", "顺序访问", "随机访问", "碎片", "增长"]
+    rows = section["children"]
+    assert [r["title"] for r in rows] == ["连续", "链接", "索引"]
+    first = rows[0]
+    assert [c["title"] for c in first["children"]] == ["快", "快", "外部", "难"]
+    assert [c["labels"] for c in first["children"]] == [
+        ["顺序访问"], ["随机访问"], ["碎片"], ["增长"],
+    ]
+    # 表头/分隔行不应成为节点
+    assert "结构" not in [r["title"] for r in rows]
+
+
+def test_markdown_blockquote_becomes_note():
+    """引用块（> 开头）应变成前一个节点的备注。"""
+    root, topics, _ = _parse_markdown_outline(
+        "# 根\n"
+        "- 注意：要点\n"
+        "> 补充说明：这是备注\n"
+        "- 下一项\n"
+    )
+    assert topics[0]["title"] == "注意：要点"
+    assert topics[0]["notes"] == "补充说明：这是备注"
+    # 备注要直接显示在画布上（XMind 的 notesDisplay: block）
+    assert topics[0]["notesDisplay"] == "block"
+    assert topics[1]["title"] == "下一项"
+    assert "notes" not in topics[1]
+
+
+async def test_import_markdown_writes_labels_and_bold(tmp_path: Path, config: Config):
+    """import_markdown 要把解析出的标签/加粗样式真正写进 xmind 文件。"""
+    tools = XMindTools(config)
+    path = tmp_path / "fmt.xmind"
+    md = (
+        "# 根\n"
+        "- **重点**\n"
+        "| 名称 | 值 |\n"
+        "|------|----|\n"
+        "| A | 1 |\n"
+    )
+    result = await tools.call_tool("import_markdown", {
+        "file_path": str(path),
+        "markdown": md,
+    })
+    assert "已从 Markdown 创建" in result[0].text
+
+    xm = parse_xmind(path)
+    bold = [n for n in xm.all_topics() if n.title == "重点"]
+    assert bold and bold[0].style["properties"]["fo:font-weight"] == "bold"
+    labels = [n.labels for n in xm.all_topics() if n.title == "1"]
+    assert labels == [["值"]]
+    # 表格行直接挂在根主题下，根被标记为电子表格结构
+    root = next(n for n in xm.all_topics() if n.title == "根")
+    assert root.structure_class == "org.xmind.ui.spreadsheet"
 
 
 def test_set_node_style_atomic_on_error(tmp_path: Path):
