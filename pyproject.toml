@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xmind-mcp-server"
-version = "0.2.7"
+version = "0.2.8"
 description = "让大模型读写 XMind 文件，支持图片 OCR 的 MCP Server"
 readme = "README.md"
 license = {text = "MIT"}
@@ -30,6 +30,8 @@ dependencies = [
     # OCR 依赖设为必装，保证 pip install 后开箱即用（首次启动只需下载模型）
     "rapidocr-onnxruntime>=1.2.0",
     "onnxruntime>=1.16.0",
+    # 用 mathtext 把 Markdown 里的 LaTeX 公式渲染成图片，插入对应节点
+    "matplotlib>=3.5.0",
 ]
 
 [project.optional-dependencies]

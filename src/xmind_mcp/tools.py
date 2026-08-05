@@ -57,6 +57,8 @@ import io
 import json
 import os
 import re
+import sys
+import tempfile
 import threading
 import zipfile
 from pathlib import Path
@@ -65,6 +67,7 @@ from typing import Any, Optional
 from mcp import types
 
 from .config import Config
+from .formula import render_latex_png, try_extract_single_line
 from .hardware.installer import verify_installed
 from .xmind_parser import parse_xmind, load_topic_image, XMindFile, TopicNode
 from .xmind_props import THEME_LEVELS
@@ -1616,13 +1619,15 @@ class XMindTools:
             root_meta=root_meta,
         )
         xm = writer.xm
+        eq_count = _inject_equations(xm, writer, topics, root_meta)
         self.workspace._cache[os.path.abspath(file_path)] = (
             os.path.getmtime(file_path),
             xm,
             writer,
         )
         node_count = len(xm.all_topics())
-        return f"✅ 已从 Markdown 创建文件: {file_path}\n根主题: {root_title}\n节点总数: {node_count}"
+        eq_note = f"\n公式: {eq_count} 个（已渲染为图片）" if eq_count else ""
+        return f"✅ 已从 Markdown 创建文件: {file_path}\n根主题: {root_title}\n节点总数: {node_count}{eq_note}"
 
     async def _import_markdown_file(self, args: dict) -> str:
         md_path = args["file_path"]
@@ -1648,15 +1653,17 @@ class XMindTools:
             root_meta=root_meta,
         )
         xm = writer.xm
+        eq_count = _inject_equations(xm, writer, topics, root_meta)
         self.workspace._cache[os.path.abspath(output_path)] = (
             os.path.getmtime(output_path),
             xm,
             writer,
         )
         node_count = len(xm.all_topics())
+        eq_note = f"\n公式: {eq_count} 个（已渲染为图片）" if eq_count else ""
         return (
             f"✅ 已原样转换 Markdown: {output_path}\n"
-            f"来源文件: {md_path}\n根主题: {root_title}\n节点总数: {node_count}"
+            f"来源文件: {md_path}\n根主题: {root_title}\n节点总数: {node_count}{eq_note}"
         )
 
     async def _repair_file(self, args: dict) -> str:
@@ -2324,6 +2331,28 @@ def _parse_markdown_outline(markdown: str) -> tuple[str, list[dict], dict]:
             items.append({"kind": "note", "text": note_text})
             i += 1
             continue
+        if stripped_line.startswith("$$"):
+            # 块级公式：$$...$$（可跨多行），随后渲染成图片插入节点
+            seg = stripped_line[2:].strip()
+            if "$$" in seg:
+                latex = seg.split("$$", 1)[0].strip()
+                i += 1
+            else:
+                latex = seg
+                i += 1
+                while i < len(lines):
+                    nxt = lines[i].strip()
+                    if "$$" in nxt:
+                        rest = nxt.split("$$", 1)[0].strip()
+                        if rest:
+                            latex += "\n" + rest
+                        i += 1
+                        break
+                    latex += "\n" + nxt
+                    i += 1
+            base = current_heading + 1 if current_heading else 0
+            items.append({"level": base + indent // 2, "kind": "equation", "latex": latex.strip()})
+            continue
         # 列表/普通文本：只认“符号 + 空格”的列表标记，
         # 避免把行首 **加粗** 当成 * 列表符号吃掉
         text = re.sub(r"^(?:[-+>]\s+|[-*+]\s+)+", "", stripped_line).strip()
@@ -2364,6 +2393,9 @@ def _parse_markdown_outline(markdown: str) -> tuple[str, list[dict], dict]:
             table_header = item.get("table_meta")
             if table_header:
                 _apply_table_meta(parent, table_header)
+        elif item["kind"] == "equation":
+            # 公式节点：标题暂存 LaTeX，_formula 标记用于导入后渲染成图片
+            child = {"title": item["latex"], "_formula": item["latex"], "children": []}
         else:
             text, bold, italic = _strip_inline_markup(item["text"])
             child = {"title": text, "children": []}
@@ -2387,10 +2419,92 @@ def _parse_markdown_outline(markdown: str) -> tuple[str, list[dict], dict]:
             for key in ("structureClass", "extensions", "notesDisplay", "style")
             if real_root.get(key)
         }
+        # 中心主题本身是一个公式节点（如 md 只有一行 $$...$$ 时）也要能渲染
+        if real_root.get("_formula"):
+            root_meta["_formula"] = real_root["_formula"]
         return real_root["title"], real_root["children"], root_meta
     # 多个顶层条目（平铺列表 / 多个 # 标题）→ 自动加“未命名”中心主题，
     # 所有顶层条目保持兄弟关系，不被错误嵌套
     return "未命名", top_level, {}
+
+
+def _render_formula_to_temp(latex: str) -> Optional[str]:
+    """把 LaTeX 公式渲染成临时 PNG，返回路径；失败返回 None。"""
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    if render_latex_png(latex, path):
+        return path
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return None
+
+
+def _inject_equations(xm: XMindFile, writer: XMindWriter, topics: list[dict], root_meta: dict) -> int:
+    """把 topics/root 结构里标记了 _formula 的节点渲染成图片并插入生成的 xmind。
+
+    公式节点在 XMindWriter.create 时被 _build_topic 创建（_formula 标记被忽略），
+    标题暂存为 LaTeX 文本。这里按路径定位到对应节点，渲染图片后插入，
+    并清空标题（图片即内容）。渲染失败时保留 LaTeX 文本，不影响导入。
+
+    返回成功插入的公式数量。
+    """
+    eqs: list[tuple[list[int], str]] = []
+    # 中心主题本身是公式（如 md 只有一行 $$...$$）
+    if root_meta.get("_formula"):
+        eqs.append(([], root_meta["_formula"]))
+
+    def walk(node_list: list[dict], path: list[int]) -> None:
+        for idx, child in enumerate(node_list):
+            latex = child.get("_formula")
+            if latex:
+                eqs.append((path + [idx], latex))
+            walk(child.get("children") or [], path + [idx])
+
+    walk(topics, [])
+    if not eqs:
+        return 0
+
+    root = (xm.raw_content[0] or {}).get("rootTopic") or {}
+    inserted = 0
+    for path, latex in eqs:
+        topic: Any = root
+        ok_nav = True
+        for idx in path:
+            kids = (topic.get("children") or {}).get("attached") or []
+            if idx < len(kids):
+                topic = kids[idx]
+            else:
+                ok_nav = False
+                break
+        if not ok_nav or not topic.get("id"):
+            continue
+        png = _render_formula_to_temp(latex)
+        if not png:
+            continue
+        try:
+            ok, _ = writer.add_image(topic["id"], png)
+        finally:
+            try:
+                os.remove(png)
+            except OSError:
+                pass
+        if ok:
+            topic["title"] = ""  # 图片即内容，清空暂存的 LaTeX 标题
+            inserted += 1
+    if inserted:
+        xm.refresh_from_raw()
+        # add_image 只更新内存和 _extra_files，必须 save 才把图片写进磁盘 zip
+        try:
+            writer.save()
+        except Exception as exc:  # 保存失败不影响导入结果，但磁盘上无图片
+            print(
+                f"[xmind-mcp] 公式图片保存失败: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+    return inserted
 
 
 def _build_svg(xm: XMindFile) -> tuple[str, dict]:

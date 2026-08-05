@@ -350,6 +350,55 @@ async def test_import_markdown_file_tool(config: Config, tmp_path: Path):
     assert "int x = 1;" in titles
 
 
+async def test_import_markdown_renders_block_equations(config: Config, tmp_path: Path):
+    """块级 $$...$$ 公式应被渲染成图片插入节点，行内 $...$ 保持文本。"""
+    tools = XMindTools(config)
+    path = tmp_path / "equations.xmind"
+    md = (
+        "# 高数\n"
+        "$$\n"
+        "E = mc^2\n"
+        "$$\n"
+        "$x^2$ 是行内公式\n"
+    )
+    result = await tools.call_tool("import_markdown", {
+        "file_path": str(path),
+        "markdown": md,
+    })
+    assert "公式: 1 个" in result[0].text
+
+    # 磁盘 zip 里应有渲染出的图片资源
+    import zipfile
+    with zipfile.ZipFile(path) as zf:
+        res = [n for n in zf.namelist() if n.startswith("resources/") and n.endswith(".png")]
+        assert len(res) == 1
+        assert zf.read(res[0])  # 非空
+
+        content = json.loads(zf.read("content.json"))
+    root = content[0]["rootTopic"]
+    attached = root["children"]["attached"]
+    # 第一个子节点是公式（图片，标题被清空），第二个是行内公式文本
+    assert "image" in attached[0]
+    assert attached[0]["image"]["src"].startswith("xap:resources/")
+    assert attached[1]["title"] == "$x^2$ 是行内公式"
+
+
+async def test_import_markdown_keeps_unrenderable_formula_text(config: Config, tmp_path: Path):
+    """mathtext 渲染不了的公式应保留原始 LaTeX 文本，不导致导入失败。"""
+    tools = XMindTools(config)
+    path = tmp_path / "bad_equation.xmind"
+    # \begin{aligned} 多行环境是 mathtext 不支持的命令，应原样保留
+    md = "# 根\n$$\n\\begin{aligned} a &= b \\end{aligned}\n$$\n"
+    result = await tools.call_tool("import_markdown", {
+        "file_path": str(path),
+        "markdown": md,
+    })
+    assert "已从 Markdown 创建" in result[0].text
+    xm = parse_xmind(path)
+    titles = [n.title for n in xm.all_topics()]
+    assert any("aligned" in (t or "") for t in titles)
+
+
 async def test_repair_file_tool(config: Config, tmp_path: Path):
     """repair_file 能把缺 metadata.json 的文件补全并恢复读取。"""
     import json

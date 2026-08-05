@@ -332,6 +332,29 @@ xmind-mcp
 模型会调用 `add_summary`、`add_boundary`、`add_relationship`、`apply_style_preset`，
 这些都是 XMind 原生视觉元素，可以在 XMind 里继续调整。
 
+### 例 8：导入带公式的 Markdown
+
+> 把一份含数学公式的 Markdown 笔记转成 `D:\\docs\\高数.xmind`。
+
+```markdown
+# 高数笔记
+
+质能方程：
+
+$$
+E = mc^2
+$$
+
+**牛顿第二定律**
+$$
+F = ma
+$$
+```
+
+模型调用 `import_markdown` 时，会自动识别块级 `$$...$$` 公式，
+用 matplotlib 渲染成图片并插入对应节点（免费版 XMind 也能显示）。
+行内公式 `$...$` 保持为文本；mathtext 渲染不了的公式会原样保留不报错。
+
 ***
 
 ## ⚙️ 命令行参数
