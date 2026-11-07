@@ -13,17 +13,24 @@ XMind MCP Server 是一个基于 [Model Context Protocol (MCP)](https://modelcon
 
 ## ✨ 核心亮点
 
-### 1. 不只是读文字，还能读图片
+### 1. 不只是读文字，还能把图片交给模型
 
-普通方式只能让模型看到节点的标题文字。XMind MCP Server 会对节点中的图片进行本地 OCR，把图片里的文字也喂给模型，真正“看懂”整份思维导图。
+普通方式只能让模型看到节点的标题文字。本服务提供两种看图方式：
+
+- **多模态模型（默认）**：`read_all` / `get_image` 直接把图片内联返回，模型看到的是原图，
+  图表、截图、手写批注里的版面关系都能理解；长边自动压到 1024 并转 JPEG，控制 token 成本。
+- **纯文本模型**：`image_mode=ocr`（或 `read_image_ocr`）走本地 OCR，只把文字喂给模型，
+  零云端依赖、不消耗视觉 token。
 
 ```text
 📄 工作表: 操作系统
 └─ [L0] [id: root-1] 操作系统
-   └─ [L1] [id: abc-123] 📷图片
-         ↳ [OCR] 中央处理器
-                (CPU)
+   └─ [L1] [id: abc-123] 📷图片        ← 默认：原图作为图片一起返回
+         ↳ [OCR] 中央处理器 (CPU)      ← image_mode=ocr 时：只给文字
 ```
+
+另外 `get_preview` 会把 XMind 保存时生成的整图缩略图返回给模型——这是 XMind 自己渲染的画面，
+比任何自绘示意都接近用户在软件里看到的效果，适合让模型先看一眼整体版式和配色。
 
 ### 2. 既能读，也能写
 
@@ -63,6 +70,8 @@ XMind MCP Server 是一个基于 [Model Context Protocol (MCP)](https://modelcon
 保存时不会破坏 XMind 文件中的样式、主题、附件、manifest 等资源，只修改
 `content.json`，再安全重组 ZIP。**覆盖保存原文件前会自动备份到
 `~/.xmind-mcp/backups/`（每个文件保留最近 20 份）**，模型改坏了也能找回。
+保存时会移除过期的 `Thumbnails/thumbnail.png`（内容已变，旧缩略图会误导预览），
+XMind 下次打开保存时会重新生成。
 
 ### 6. Markdown 公式自动渲染
 
@@ -78,7 +87,7 @@ XMind MCP Server 是一个基于 [Model Context Protocol (MCP)](https://modelcon
 | -------- | ------------------------------------ | ---------------- |
 | 读文本节点    | ✅ 可以                                 | ✅ 可以             |
 | 找图片位置    | ⚠️ 容易漏（summary、attachment、notes 里的图） | ✅ 封装完整           |
-| 理解图片内容   | ❌ 必须依赖多模态模型                          | ✅ 本地 OCR，不依赖模型能力 |
+| 理解图片内容   | ❌ 必须依赖多模态模型                          | ✅ 原图直给多模态模型；纯文本模型退回本地 OCR |
 | 写回 xmind | ⚠️ 要手动处理 manifest checksum、ZIP 重组    | ✅ 封装安全写回         |
 | 批量处理     | ⚠️ 自己写循环                             | ✅ 统一接口           |
 | 被大模型调用   | ❌ 需要额外包装                             | ✅ MCP 标准协议       |
@@ -195,8 +204,10 @@ xmind-mcp
 | 工具                | 说明                                                                               |
 | ----------------- | -------------------------------------------------------------------------------- |
 | `read_structure`  | 读取节点树结构，默认输出层级 + 节点 ID                                                           |
-| `read_all`        | 节点树 + 图片 OCR + notes/labels/markers/超链接/样式元数据，支持 `max_depth` / `max_nodes` 防爆上下文 |
+| `read_all`        | 节点树 + 图片 + notes/labels/markers/超链接/样式元数据，支持 `max_depth` / `max_nodes` / `image_mode` 防爆上下文 |
 | `list_images`     | 列出所有含图片的节点                                                                       |
+| `get_image`       | 读取节点原图并作为图片返回（多模态模型首选），可选同时返回 OCR 文本                                        |
+| `get_preview`     | 返回 XMind 自带的整图缩略图，看整体版式和配色                                                     |
 | `read_image_ocr`  | 对指定节点的图片做 OCR                                                                    |
 | `find_node`       | 按标题关键词搜索节点，返回 ID 和路径                                                             |
 | `get_node`        | 读取单个节点完整信息（含主题类型、节点自身样式、主题继承样式、超链接、父节点）                                          |
@@ -361,6 +372,20 @@ $$
 模型调用 `import_markdown` 时，会自动识别块级 `$$...$$` 公式，
 用 matplotlib 渲染成图片并插入对应节点（免费版 XMind 也能显示）。
 行内公式 `$...$` 保持为文本；mathtext 渲染不了的公式会原样保留不报错。
+
+### 例 9：看图改图
+
+> 先看一眼 `D:\docs\操作系统.xmind` 现在的样子，然后把颜色改柔和一点。
+
+模型会调用 `get_preview` 拿到整图判断当前配色和版式（文件需由 XMind 保存过才有缩略图），
+再用 `analyze_style` 看具体色值，最后 `set_theme_style` / `apply_style_preset` 调整并保存。
+保存会移除旧缩略图，避免预览显示过期画面。
+
+### 例 10：把截图/照片转成导图
+
+> 这是我拍的板书，帮我整理成思维导图。
+
+模型先 `get_image` 读取图片（多模态直接看），再按识别出的层级调用 `create_file` 落盘。
 
 ***
 

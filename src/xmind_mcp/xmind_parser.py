@@ -359,6 +359,27 @@ def parse_xmind(file_path: Union[str, Path]) -> XMindFile:
     )
 
 
+def load_preview_image(xm: XMindFile) -> Optional[bytes]:
+    """读取 XMind 保存时生成的整图缩略图。
+
+    XMind 每次保存都会写 Thumbnails/thumbnail.png，内容就是用户在软件里
+    看到的渲染结果，比任何自绘示意都准确。文件被本工具改过并保存后，
+    这张图会失效，因此写入器保存时会主动移除它。
+    """
+    if not xm._zip_bytes:
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(xm._zip_bytes)) as zf:
+            names = {name.lower(): name for name in zf.namelist()}
+            for candidate in ("thumbnails/thumbnail.png", "thumbnail.png"):
+                actual = names.get(candidate)
+                if actual:
+                    return zf.read(actual)
+    except (KeyError, zipfile.BadZipFile, OSError):
+        return None
+    return None
+
+
 def load_topic_image(topic: TopicNode, xm: XMindFile) -> Optional[bytes]:
     """加载某个节点的图片数据（从 zip 中提取）。"""
     if not topic.image_src:

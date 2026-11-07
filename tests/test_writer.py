@@ -672,3 +672,37 @@ def test_apply_style_preset_unknown_raises(sample_xmind: Path):
     writer = XMindWriter(xm)
     with pytest.raises(ValueError, match="未知样式预设"):
         writer.apply_style_preset("不存在的预设")
+
+
+def test_removed_attachment_also_leaves_manifest(tmp_path: Path):
+    """删除未引用附件时，manifest 里也不能留下它的登记。"""
+    import zipfile
+
+    path = tmp_path / "att.xmind"
+    content = [{
+        "id": "s", "title": "S",
+        "rootTopic": {"id": "root", "title": "R", "children": {"attached": [
+            {"id": "c1", "title": "C1"},
+        ]}},
+    }]
+    manifest = {"file-entries": {
+        "content.json": {},
+        "metadata.json": {},
+        "attachments/images/unused.png": {},
+    }}
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("content.json", json.dumps(content, ensure_ascii=False))
+        zf.writestr("metadata.json", "{}")
+        zf.writestr("manifest.json", json.dumps(manifest))
+        zf.writestr("attachments/images/unused.png", b"fake")
+
+    writer = XMindWriter(parse_xmind(path))
+    removed = writer.remove_unused_attachments()
+    assert removed == ["attachments/images/unused.png"]
+    writer.save()
+
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+        saved_manifest = json.loads(zf.read("manifest.json"))
+    assert "attachments/images/unused.png" not in names
+    assert "attachments/images/unused.png" not in saved_manifest["file-entries"]

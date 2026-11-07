@@ -112,6 +112,16 @@ DEFAULT_METADATA: dict = {
     "creator": {"name": "xmind-mcp", "version": __version__},
 }
 
+# XMind 保存时生成的整图缩略图。本工具改完 content.json 后它就过期了，
+# 原样带回去会让文件管理器 / get_preview 显示旧画面，所以保存时主动移除，
+# 由 XMind 下次打开并保存时重新生成。
+_THUMBNAIL_ENTRY = "thumbnails/thumbnail.png"
+
+
+def _is_preview_asset(name: str) -> bool:
+    return name.lower().rstrip("/") == _THUMBNAIL_ENTRY
+
+
 # 内置默认主题（与 XMind 26 实际保存的默认主题结构一致），缓存避免重复读盘。
 _DEFAULT_THEME: Optional[dict] = None
 
@@ -513,6 +523,8 @@ class XMindWriter:
         self._extra_files: dict[str, bytes] = {}
         # 保存时要排除的 zip 条目（如删除的未引用附件）
         self._exclude_files: set[str] = set()
+        # 上一次保存是否移除了过期缩略图（供工具层提示）
+        self.dropped_preview = False
 
     @staticmethod
     def _new_sheet(
@@ -1311,6 +1323,7 @@ class XMindWriter:
         except zipfile.BadZipFile:
             zin = None
 
+        dropped_preview = False
         with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zout:
             written: set[str] = set()
             manifest: dict = {}
@@ -1319,6 +1332,10 @@ class XMindWriter:
                     for item in zin.infolist():
                         if item.filename in self._exclude_files:
                             # 用户主动移除的附件/资源，不再写入
+                            continue
+                        if _is_preview_asset(item.filename):
+                            # content.json 已改，旧缩略图会误导预览
+                            dropped_preview = True
                             continue
                         if item.filename == "content.json":
                             zout.writestr("content.json", new_content)
@@ -1363,10 +1380,17 @@ class XMindWriter:
             for name in written:
                 if name != "manifest.json" and not name.endswith("/"):
                     entries.setdefault(name, {})
+            # 没写进新 zip 的条目不能继续留在 manifest 里，
+            # 否则 XMind 会以为附件还在（旧缩略图同理）
+            dropped = set(self._exclude_files)
+            for name in [n for n in entries if n in dropped or _is_preview_asset(n)]:
+                entries.pop(name, None)
             zout.writestr(
                 "manifest.json",
                 json.dumps(manifest, ensure_ascii=False, indent=2),
             )
+
+        self.dropped_preview = dropped_preview
 
         # 更新内部缓存
         with open(output_path, "rb") as f:

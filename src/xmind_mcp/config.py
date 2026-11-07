@@ -30,6 +30,11 @@ class Config:
     ram_gb: float = 0.0
     # 操作系统：windows | linux | macos
     os: str = ""
+    # 读取导图时图片怎么处理：inline（默认，把原图交给多模态模型）
+    # | ocr（只给文字，适合纯文本模型）| both | off
+    image_mode: str = "inline"
+    # 内联图片的长边上限（像素），越大越贵
+    image_max_side: int = 1024
     # 是否已完成首次安装
     initialized: bool = False
     # 安装时用的 pip 包列表（用于二次验证）

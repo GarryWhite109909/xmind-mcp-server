@@ -322,7 +322,9 @@ async def test_read_all_ocr_respects_max_depth(config: Config, tmp_path: Path):
         return OcrResult(text="TEXT", lines=[])
 
     tools.ocr.recognize = fake_recognize
-    result = await tools.call_tool("read_all", {"file_path": str(p), "max_depth": 1})
+    result = await tools.call_tool(
+        "read_all", {"file_path": str(p), "max_depth": 1, "image_mode": "ocr"}
+    )
     assert len(calls) == 1
     assert "TEXT" in result[0].text
 

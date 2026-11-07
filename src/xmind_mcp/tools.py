@@ -6,6 +6,8 @@
     read_all          — 读取结构 + 图片 OCR + 节点元数据
     list_images       — 列出所有含图片的节点
     read_image_ocr    — 对指定节点的图片做 OCR
+    get_image         — 把节点原图作为图片返回给多模态模型
+    get_preview       — 返回 XMind 自带的整图缩略图
     find_node         — 按关键词搜索节点，返回 ID 和路径
     get_node          — 读取单个节点的完整信息（含样式、超链接、父节点）
     analyze_file      — 统计/体检：节点数、深度、重复标题、空节点等
@@ -69,7 +71,14 @@ from mcp import types
 from .config import Config
 from .formula import render_latex_png, try_extract_single_line
 from .hardware.installer import verify_installed
-from .xmind_parser import parse_xmind, load_topic_image, XMindFile, TopicNode
+from .image_payload import DEFAULT_MAX_SIDE, PreparedImage, prepare_image
+from .xmind_parser import (
+    parse_xmind,
+    load_preview_image,
+    load_topic_image,
+    XMindFile,
+    TopicNode,
+)
 from .xmind_props import THEME_LEVELS
 from .xmind_writer import XMindWriter, list_backups, restore_backup
 from .ocr.manager import OCRManager
@@ -115,6 +124,46 @@ class XMindWorkspace:
 # 单次输出里备注/OCR 文本的最大长度，防止超长内容撑爆模型上下文
 MAX_NOTE_CHARS = 2000
 MAX_OCR_CHARS = 2000
+
+# 一次读取最多内联多少张图，超出部分只给坐标提示
+MAX_INLINE_IMAGES = 8
+
+# auto 表示“跟随配置”，其余是显式模式
+_IMAGE_MODES = ("off", "ocr", "inline", "both", "auto")
+
+
+def _text_block(text: str) -> types.TextContent:
+    return types.TextContent(type="text", text=text)
+
+
+def _image_block(image: PreparedImage) -> types.ImageContent:
+    # mcp 2.x 的字段名是 mime_type（序列化时自动转成 mimeType）
+    return types.ImageContent(type="image", data=image.base64, mime_type=image.mime_type)
+
+
+def _content_blocks(result) -> list:
+    """handler 可以返回纯文本，也可以返回带图片的内容块列表。"""
+    if isinstance(result, str):
+        return [_text_block(result)]
+    return list(result)
+
+
+def _resolve_image_mode(value: Optional[str], config: Config) -> str:
+    """把 auto 解析成配置里的模式；非法值一律按配置处理。"""
+    mode = (value or "auto").lower()
+    if mode not in _IMAGE_MODES:
+        mode = "auto"
+    if mode == "auto":
+        mode = (getattr(config, "image_mode", "") or "inline").lower()
+        if mode not in ("off", "ocr", "inline", "both"):
+            mode = "inline"
+    return mode
+
+
+def _prepare_image_arg(data: Optional[bytes], max_side) -> Optional[PreparedImage]:
+    if not data:
+        return None
+    return prepare_image(data, max_side=max_side or DEFAULT_MAX_SIDE)
 
 
 def _truncate(text: str, limit: int, hint: str = "已截断") -> str:
@@ -338,7 +387,26 @@ def _effective_style(node: TopicNode, xm: XMindFile) -> dict:
 
 # ---------- 工具定义 ----------
 
+# 只读工具：不改文件、不写盘，客户端可以放心自动批准
+_READ_ONLY_TOOLS = {
+    "read_structure", "read_all", "list_images", "read_image_ocr",
+    "get_image", "get_preview", "find_node", "get_node",
+    "analyze_file", "analyze_style", "export_markdown", "export_text",
+    "list_sheets", "list_attachments", "list_backups", "get_hardware_info",
+}
+
+# 会删除或覆盖既有内容的工具，客户端应向用户确认
+_DESTRUCTIVE_TOOLS = {
+    "delete_node", "delete_sheet",
+    "remove_marker", "remove_label", "remove_boundary", "remove_relationship",
+    "delete_empty_nodes", "merge_duplicate_nodes", "remove_unused_attachments",
+    "batch_update_titles", "restore_backup", "repair_file",
+    "save_file", "create_file",
+}
+
+
 def _tool(name: str, description: str, properties: dict, required: list[str] = None) -> types.Tool:
+    read_only = name in _READ_ONLY_TOOLS
     return types.Tool(
         name=name,
         description=description,
@@ -347,6 +415,11 @@ def _tool(name: str, description: str, properties: dict, required: list[str] = N
             "properties": properties,
             "required": required or [],
         },
+        annotations=types.ToolAnnotations(
+            read_only_hint=read_only,
+            destructive_hint=None if read_only else name in _DESTRUCTIVE_TOOLS,
+            open_world_hint=False,
+        ),
     )
 
 
@@ -370,7 +443,7 @@ def build_tool_list() -> list[types.Tool]:
         ),
         _tool(
             "read_all",
-            "一步到位：读取节点树 + 对所有图片节点做 OCR + 输出 notes/labels/markers/超链接/样式元数据。",
+            "一步到位：读取节点树 + 图片 + notes/labels/markers/超链接/样式元数据。默认把每个图片节点的原图作为图片一起返回（适合多模态模型）；纯文本模型用 image_mode=ocr 只要文字。",
             {
                 "file_path": file_path_prop,
                 "include_ids": {"type": "boolean", "description": "是否在每行后输出节点 ID（默认 true）"},
@@ -378,6 +451,13 @@ def build_tool_list() -> list[types.Tool]:
                 "include_style": {"type": "boolean", "description": "是否输出每个节点的样式属性（默认 false）"},
                 "max_depth": {"type": "integer", "description": "只输出到该层级（可选，根主题为 L0）"},
                 "max_nodes": {"type": "integer", "description": "最多输出多少个节点，超出截断（可选）"},
+                "image_mode": {
+                    "type": "string",
+                    "enum": ["auto", "inline", "ocr", "both", "off"],
+                    "description": "图片处理方式：inline=返回原图（默认），ocr=只给识别文字，both=两者，off=都不给",
+                },
+                "max_images": {"type": "integer", "description": "最多内联多少张图（默认 8）"},
+                "image_max_side": {"type": "integer", "description": "内联图片长边上限（默认 1024）"},
             },
             ["file_path"],
         ),
@@ -395,6 +475,26 @@ def build_tool_list() -> list[types.Tool]:
                 "node_id": {"type": "string", "description": "包含图片的节点 ID"},
             },
             ["file_path", "node_id"],
+        ),
+        _tool(
+            "get_image",
+            "读取节点的图片本身并作为图片返回，多模态模型可直接看图（图表、截图、手写内容比 OCR 文本准得多）。默认把长边压到 1024、转 JPEG；需要文字时加 include_ocr=true。",
+            {
+                "file_path": file_path_prop,
+                "node_id": {"type": "string", "description": "包含图片的节点 ID"},
+                "max_side": {"type": "integer", "description": "长边像素上限（默认 1024）"},
+                "include_ocr": {"type": "boolean", "description": "是否同时返回 OCR 文本（默认 false）"},
+            },
+            ["file_path", "node_id"],
+        ),
+        _tool(
+            "get_preview",
+            "返回 XMind 保存时生成的整图缩略图（Thumbnails/thumbnail.png）。这是 XMind 自己渲染的画面，最接近用户在软件里看到的效果，适合让模型先看一眼整体版式和配色。",
+            {
+                "file_path": file_path_prop,
+                "max_side": {"type": "integer", "description": "长边像素上限（默认 1024）"},
+            },
+            ["file_path"],
         ),
         _tool(
             "find_node",
@@ -1015,25 +1115,29 @@ class XMindTools:
         """释放 OCR 模型等资源。"""
         self.ocr.unload()
 
-    async def call_tool(self, name: str, arguments: dict) -> list[types.TextContent]:
+    async def call_tool(self, name: str, arguments: dict) -> list:
         messages, _ = await self.call_tool_status(name, arguments)
         return messages
 
-    async def call_tool_status(self, name: str, arguments: dict) -> tuple[list[types.TextContent], bool]:
-        """调用工具并返回 (消息, 是否错误)。错误信息同时让 MCP 标记 isError。"""
+    async def call_tool_status(self, name: str, arguments: dict) -> tuple[list, bool]:
+        """调用工具并返回 (内容块, 是否错误)。错误信息同时让 MCP 标记 isError。
+
+        内容块可以是 TextContent，也可以是 ImageContent —— 多模态客户端
+        才能看到节点原图，而不是只能读 OCR 转出来的文字。
+        """
         handler = self._handlers.get(name)
         if handler is None:
-            return [types.TextContent(type="text", text=f"未知工具: {name}")], True
+            return [_text_block(f"未知工具: {name}")], True
 
         try:
             result = await handler(self, arguments)
-            return [types.TextContent(type="text", text=result)], False
+            return _content_blocks(result), False
         except FileNotFoundError as e:
-            return [types.TextContent(type="text", text=f"❌ 文件不存在或路径错误: {e}")], True
+            return [_text_block(f"❌ 文件不存在或路径错误: {e}")], True
         except PermissionError as e:
-            return [types.TextContent(type="text", text=f"❌ 文件被占用或无权限访问: {e}")], True
+            return [_text_block(f"❌ 文件被占用或无权限访问: {e}")], True
         except Exception as e:
-            return [types.TextContent(type="text", text=f"❌ 错误: {type(e).__name__}: {e}")], True
+            return [_text_block(f"❌ 错误: {type(e).__name__}: {e}")], True
 
     # ---- 各工具实现 ----
 
@@ -1080,21 +1184,92 @@ class XMindTools:
         body = result.text if result.text else "（未识别到文字）"
         return f"{header}\n{body}"
 
-    async def _read_all(self, args: dict) -> str:
+    async def _get_image(self, args: dict) -> list:
+        """把节点图片作为图片内容返回，交给多模态模型直接看。"""
+        xm, _ = self.workspace.get(args["file_path"])
+        node = xm.find_topic(args["node_id"])
+        if node is None:
+            return [_text_block(f"找不到节点: {args['node_id']}")]
+        if not node.image_src:
+            return [_text_block(f"节点「{_clean_title(node.title)}」没有图片。")]
+
+        image_data = load_topic_image(node, xm)
+        if not image_data:
+            return [_text_block(f"图片加载失败: {node.image_src}")]
+
+        max_side = args.get("max_side") or self.config.image_max_side
+        prepared = _prepare_image_arg(image_data, max_side)
+        if prepared is None:
+            return [_text_block(
+                f"图片无法解码（{node.image_src}），可能是不支持的格式。"
+            )]
+
+        title = _clean_title(node.title) or "（无标题）"
+        caption = (
+            f"📷 节点「{title}」(ID: {node.id}) 的图片："
+            f"{prepared.source_width}×{prepared.source_height} → "
+            f"{prepared.width}×{prepared.height}，{prepared.size_kb}KB"
+        )
+        blocks: list = [_text_block(caption), _image_block(prepared)]
+
+        if args.get("include_ocr"):
+            try:
+                result = await asyncio.to_thread(self.ocr.recognize, image_data)
+                text = _truncate(result.text or "（未识别到文字）", MAX_OCR_CHARS)
+                blocks.append(_text_block(f"↳ [OCR] {text}"))
+            except Exception as e:
+                blocks.append(_text_block(f"↳ [OCR] 失败: {type(e).__name__}: {e}"))
+        return blocks
+
+    async def _get_preview(self, args: dict) -> list:
+        """返回 XMind 自己渲染的整图缩略图。"""
+        xm, _ = self.workspace.get(args["file_path"])
+        image_data = load_preview_image(xm)
+        if not image_data:
+            return [_text_block(
+                "该文件没有内嵌缩略图。可能原因：文件由本工具保存过（保存时移除了过期缩略图），"
+                "或 XMind 从未保存过该文件。\n"
+                "可选做法：在 XMind 里打开并保存一次；或用 export_svg 导出示意图；"
+                "或直接用 read_all 读取结构。"
+            )]
+
+        max_side = args.get("max_side") or self.config.image_max_side
+        prepared = _prepare_image_arg(image_data, max_side)
+        if prepared is None:
+            return [_text_block("缩略图存在但无法解码，文件可能已损坏，可用 repair_file 修复。")]
+
+        sheet_titles = "、".join(s.title for s in xm.sheets) or "（无工作表）"
+        caption = (
+            f"🖼️ 文件缩略图（XMind 保存时渲染）：{prepared.source_width}×"
+            f"{prepared.source_height} → {prepared.width}×{prepared.height}，"
+            f"{prepared.size_kb}KB\n工作表：{sheet_titles}\n"
+            "注意：这是整份文件最近一次保存时的画面，多工作表只展示其中一张。"
+        )
+        return [_text_block(caption), _image_block(prepared)]
+
+    async def _read_all(self, args: dict):
         xm, _ = self.workspace.get(args["file_path"])
         include_ids = args.get("include_ids", True)
         clean = args.get("clean", False)
         include_style = args.get("include_style", False)
         max_depth = args.get("max_depth")
         max_nodes = args.get("max_nodes")
-        # 只对会出现在输出里的图片节点做 OCR，
-        # 避免 max_depth/max_nodes 截断后仍全量识别
+        image_mode = _resolve_image_mode(args.get("image_mode"), self.config)
+        max_side = args.get("image_max_side") or self.config.image_max_side
+        try:
+            max_images = max(0, int(args.get("max_images", MAX_INLINE_IMAGES)))
+        except (TypeError, ValueError):
+            max_images = MAX_INLINE_IMAGES
+
+        # 只处理会出现在输出里的图片节点，
+        # 避免 max_depth/max_nodes 截断后仍全量识别或内联
         visible_ids = {n.id for n in _iter_visible_topics(xm, max_depth, max_nodes)}
         image_nodes = [n for n in xm.find_topics_with_image() if n.id in visible_ids]
 
-        # 先做所有图片的 OCR
+        # OCR 只在显式要求时跑：多模态模型看原图比 OCR 文本准得多，
+        # 还省掉 CPU 上每张 0.5~2 秒的识别时间。
         ocr_results: dict[str, str] = {}
-        if image_nodes:
+        if image_mode in ("ocr", "both"):
             for node in image_nodes:
                 try:
                     image_data = load_topic_image(node, xm)
@@ -1123,7 +1298,38 @@ class XMindTools:
             )
         if state["truncated"]:
             lines.append("…（输出已按 max_nodes 截断）")
-        return "\n".join(lines)
+
+        text = "\n".join(lines)
+        if image_mode not in ("inline", "both") or not image_nodes:
+            return text
+
+        # 图片附在文本之后：客户端按顺序渲染，模型能对照节点 ID 找到对应图
+        blocks: list = [_text_block(text)]
+        deferred = []
+        sent = 0
+        for node in image_nodes:
+            title = _clean_title(node.title) or "（无标题）"
+            if sent >= max_images:
+                deferred.append(f"节点 {node.id}「{title}」")
+                continue
+            prepared = _prepare_image_arg(load_topic_image(node, xm), max_side)
+            if prepared is None:
+                deferred.append(f"节点 {node.id}「{title}」（无法解码）")
+                continue
+            blocks.append(_text_block(
+                f"📷 图 {sent + 1} ← 节点 {node.id}「{title}」"
+                f"（{prepared.width}×{prepared.height}，{prepared.size_kb}KB）"
+            ))
+            blocks.append(_image_block(prepared))
+            sent += 1
+
+        if deferred:
+            blocks.append(_text_block(
+                f"另有 {len(deferred)} 张图未内联（超过 max_images={max_images} 或无法解码）："
+                + "；".join(deferred)
+                + "\n可调大 max_images，或用 get_image 单张读取。"
+            ))
+        return blocks
 
     @staticmethod
     def _format_node_with_ocr(
@@ -1290,7 +1496,7 @@ class XMindTools:
         output = args.get("output_path")
         saved_path = writer.save(output)
         self.workspace.refresh_after_save(saved_path)
-        return f"✅ 已保存到: {saved_path}"
+        return f"✅ 已保存到: {saved_path}{self._preview_note(writer)}"
 
     async def _export_markdown(self, args: dict) -> str:
         xm, _ = self.workspace.get(args["file_path"])
@@ -1792,12 +1998,18 @@ class XMindTools:
             lines.append(f"特殊节点 ID: {ids}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _preview_note(writer: XMindWriter) -> str:
+        if not getattr(writer, "dropped_preview", False):
+            return ""
+        return "\nℹ️ 已移除过期缩略图（内容已变，旧图会误导预览）；XMind 下次保存时会重新生成。"
+
     def _auto_save_msg(self, file_path: str, writer: XMindWriter, args: dict, msg: str) -> str:
         """编辑后统一处理保存提示。"""
         if args.get("auto_save"):
             saved_path = writer.save()
             self.workspace.refresh_after_save(saved_path)
-            return f"{msg}\n✅ 已自动保存到: {saved_path}"
+            return f"{msg}\n✅ 已自动保存到: {saved_path}{self._preview_note(writer)}"
         return f"{msg}\n⚠️ 修改未保存，请调用 save_file 或设置 auto_save=true。"
 
     async def _list_backups(self, args: dict) -> str:
@@ -2094,6 +2306,8 @@ class XMindTools:
         "read_all": _read_all,
         "list_images": _list_images,
         "read_image_ocr": _read_image_ocr,
+        "get_image": _get_image,
+        "get_preview": _get_preview,
         "find_node": _find_node,
         "add_node": _add_node,
         "update_node": _update_node,

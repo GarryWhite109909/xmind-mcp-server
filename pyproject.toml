@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xmind-mcp-server"
-version = "0.3.0"
-description = "让大模型读写 XMind 文件，支持图片 OCR 的 MCP Server"
+version = "0.4.0"
+description = "让大模型读写 XMind 文件，支持图片直传与本地 OCR 的 MCP Server"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -46,6 +46,8 @@ dev = [
 all = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "paddleocr>=2.7.0",
+    "paddlepaddle>=2.6.0",
 ]
 
 [project.scripts]

@@ -78,7 +78,7 @@ def test_server_initialize_and_list_tools(server_process: subprocess.Popen):
     list_resp = _recv(server_process)
     assert list_resp["id"] == 2
     tools = list_resp["result"]["tools"]
-    assert len(tools) == 55
+    assert len(tools) == 57
     assert any(t["name"] == "read_structure" for t in tools)
     assert any(t["name"] == "find_node" for t in tools)
     assert any(t["name"] == "export_markdown" for t in tools)
@@ -96,3 +96,5 @@ def test_server_initialize_and_list_tools(server_process: subprocess.Popen):
     assert any(t["name"] == "add_boundary" for t in tools)
     assert any(t["name"] == "add_relationship" for t in tools)
     assert any(t["name"] == "apply_style_preset" for t in tools)
+    assert any(t["name"] == "get_image" for t in tools)
+    assert any(t["name"] == "get_preview" for t in tools)

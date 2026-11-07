@@ -9,7 +9,7 @@ import pytest
 
 from xmind_mcp.config import Config
 from xmind_mcp.xmind_parser import parse_xmind
-from xmind_mcp.tools import XMindTools, format_topic_tree
+from xmind_mcp.tools import XMindTools, build_tool_list, format_topic_tree
 
 
 @pytest.fixture
@@ -664,3 +664,15 @@ async def test_read_all_shows_important_topic_marker(
     tools = XMindTools(config)
     result = await tools.call_tool("read_all", {"file_path": str(real_xmind)})
     assert "importantTopic" in result[0].text
+
+
+def test_tool_annotations_mark_read_only_and_destructive():
+    """客户端靠 annotations 决定自动批准还是弹确认。"""
+    tools = {t.name: t for t in build_tool_list()}
+
+    assert tools["read_all"].annotations.read_only_hint is True
+    assert tools["get_image"].annotations.read_only_hint is True
+    assert tools["delete_node"].annotations.read_only_hint is False
+    assert tools["delete_node"].annotations.destructive_hint is True
+    assert tools["set_node_style"].annotations.destructive_hint is False
+    assert tools["set_node_style"].annotations.open_world_hint is False
