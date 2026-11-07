@@ -7,7 +7,7 @@
     list_images       — 列出所有含图片的节点
     read_image_ocr    — 对指定节点的图片做 OCR
     get_image         — 把节点原图作为图片返回给多模态模型
-    get_preview       — 返回 XMind 自带的整图缩略图
+    get_preview       — 返回整图预览（XMind 缩略图，缺省时自绘）
     find_node         — 按关键词搜索节点，返回 ID 和路径
     get_node          — 读取单个节点的完整信息（含样式、超链接、父节点）
     analyze_file      — 统计/体检：节点数、深度、重复标题、空节点等
@@ -72,6 +72,7 @@ from .config import Config
 from .formula import render_latex_png, try_extract_single_line
 from .hardware.installer import verify_installed
 from .image_payload import DEFAULT_MAX_SIDE, PreparedImage, prepare_image
+from .render import render_sheet_png
 from .xmind_parser import (
     parse_xmind,
     load_preview_image,
@@ -599,10 +600,19 @@ def build_tool_list(toolset: str = "all") -> list[types.Tool]:
         ),
         _tool(
             "get_preview",
-            "返回 XMind 保存时生成的整图缩略图（Thumbnails/thumbnail.png）。这是 XMind 自己渲染的画面，最接近用户在软件里看到的效果，适合让模型先看一眼整体版式和配色。",
+            "返回整图预览，让模型先看一眼整体版式和配色。优先用 XMind 保存时生成的缩略图（最接近软件里的真实效果）；没有缩略图时自动用 matplotlib 自绘一张近似图。",
             {
                 "file_path": file_path_prop,
                 "max_side": {"type": "integer", "description": "长边像素上限（默认 1024）"},
+                "source": {
+                    "type": "string",
+                    "enum": ["auto", "embedded", "render"],
+                    "description": "auto=有缩略图用缩略图、没有就自绘（默认）；embedded=只要 XMind 缩略图；render=总是自绘",
+                },
+                "sheet": {
+                    "type": "integer",
+                    "description": "要自绘的工作表索引，从 0 开始（默认 0；缩略图模式下忽略）",
+                },
             },
             ["file_path"],
         ),
@@ -1354,29 +1364,80 @@ class XMindTools:
                 blocks.append(_text_block(f"↳ [OCR] 失败: {type(e).__name__}: {e}"))
         return blocks
 
+    async def _render_preview(
+        self, xm: XMindFile, sheet_index: int, max_side: int
+    ) -> tuple[Optional[bytes], str]:
+        """在后台线程里用 matplotlib 画一张近似图（matplotlib 非线程安全）。"""
+        style_of = lambda node: _effective_style(node, xm)  # noqa: E731
+
+        def _run():
+            return render_sheet_png(
+                xm, sheet_index, max_width=max_side, style_of=style_of
+            )
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # 渲染是尽力而为，不能把整个工具弄挂
+            return None, f"{type(exc).__name__}: {exc}"
+
     async def _get_preview(self, args: dict) -> list:
-        """返回 XMind 自己渲染的整图缩略图。"""
+        """返回整图预览：优先 XMind 自己保存的缩略图，没有就自己画一张。"""
         xm, _ = self.workspace.get(args["file_path"])
-        image_data = load_preview_image(xm)
-        if not image_data:
+        source = str(args.get("source") or "auto").lower()
+        if source not in ("auto", "embedded", "render"):
+            source = "auto"
+        try:
+            sheet_index = int(args.get("sheet", 0))
+        except (TypeError, ValueError):
+            sheet_index = 0
+        max_side = args.get("max_side") or self.config.image_max_side
+
+        embedded = load_preview_image(xm) if source in ("auto", "embedded") else None
+        sheet_titles = "、".join(s.title for s in xm.sheets) or "（无工作表）"
+
+        if embedded:
+            prepared = _prepare_image_arg(embedded, max_side)
+            if prepared is None:
+                return [_text_block(
+                    "缩略图存在但无法解码，文件可能已损坏，可用 repair_file 修复；"
+                    "也可以传 source=\"render\" 让工具自己画一张。"
+                )]
+            caption = (
+                f"🖼️ 文件缩略图（XMind 保存时渲染）：{prepared.source_width}×"
+                f"{prepared.source_height} → {prepared.width}×{prepared.height}，"
+                f"{prepared.size_kb}KB\n工作表：{sheet_titles}\n"
+                "注意：这是整份文件最近一次保存时的画面，多工作表只展示其中一张。"
+            )
+            return [_text_block(caption), _image_block(prepared)]
+
+        if source == "embedded":
             return [_text_block(
                 "该文件没有内嵌缩略图。可能原因：文件由本工具保存过（保存时移除了过期缩略图），"
                 "或 XMind 从未保存过该文件。\n"
-                "可选做法：在 XMind 里打开并保存一次；或用 export_svg 导出示意图；"
-                "或直接用 read_all 读取结构。"
+                "可选做法：用 source=\"render\" 让工具自己画一张；在 XMind 里打开并保存一次；"
+                "或用 export_svg 导出示意图；或直接用 read_all 读取结构。"
             )]
 
-        max_side = args.get("max_side") or self.config.image_max_side
-        prepared = _prepare_image_arg(image_data, max_side)
-        if prepared is None:
-            return [_text_block("缩略图存在但无法解码，文件可能已损坏，可用 repair_file 修复。")]
+        if not (0 <= sheet_index < len(xm.sheets)):
+            return [_text_block(
+                f"工作表索引 {sheet_index} 超出范围（共 {len(xm.sheets)} 张）。"
+            )]
 
-        sheet_titles = "、".join(s.title for s in xm.sheets) or "（无工作表）"
+        rendered, note = await self._render_preview(xm, sheet_index, max_side)
+        if rendered is None:
+            return [_text_block(
+                f"该文件没有内嵌缩略图，自绘预览也失败了：{note}\n"
+                "可选做法：定位到具体工作表用 export_svg；或直接用 read_all 读取结构。"
+            )]
+        prepared = _prepare_image_arg(rendered, max_side)
+        if prepared is None:
+            return [_text_block(f"自绘预览已生成但无法编码为图片：{note}")]
+
+        sheet_title = xm.sheets[sheet_index].title or f"#{sheet_index}"
         caption = (
-            f"🖼️ 文件缩略图（XMind 保存时渲染）：{prepared.source_width}×"
-            f"{prepared.source_height} → {prepared.width}×{prepared.height}，"
-            f"{prepared.size_kb}KB\n工作表：{sheet_titles}\n"
-            "注意：这是整份文件最近一次保存时的画面，多工作表只展示其中一张。"
+            f"🖼️ 自绘预览（近似效果）：{prepared.width}×{prepared.height}，"
+            f"{prepared.size_kb}KB\n工作表：{sheet_title}（全部：{sheet_titles}）\n"
+            f"说明：{note}。版式和配色接近 XMind，但不是逐像素还原。"
         )
         return [_text_block(caption), _image_block(prepared)]
 

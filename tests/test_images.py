@@ -122,13 +122,44 @@ async def test_get_preview_returns_thumbnail(config: Config, tmp_path: Path):
     assert Image.open(io.BytesIO(decoded)).size == (500, 300)
 
 
-async def test_get_preview_without_thumbnail_explains(config: Config, tmp_path: Path):
+async def test_get_preview_without_thumbnail_falls_back_to_render(
+    config: Config, tmp_path: Path
+):
     path = _make_xmind(tmp_path / "nothumb.xmind")
     tools = XMindTools(config)
 
     blocks = await tools.call_tool("get_preview", {"file_path": str(path)})
+    images = [b for b in blocks if getattr(b, "type", "") == "image"]
+    assert len(images) == 1
+    assert "自绘预览" in blocks[0].text
+    assert Image.open(io.BytesIO(base64.b64decode(images[0].data))).format == "JPEG"
+
+
+async def test_get_preview_embedded_only_explains(config: Config, tmp_path: Path):
+    path = _make_xmind(tmp_path / "nothumb.xmind")
+    tools = XMindTools(config)
+
+    blocks = await tools.call_tool(
+        "get_preview", {"file_path": str(path), "source": "embedded"}
+    )
     assert all(getattr(b, "type", "") == "text" for b in blocks)
     assert "没有内嵌缩略图" in blocks[0].text
+
+
+async def test_get_preview_render_ignores_embedded_thumbnail(
+    config: Config, tmp_path: Path
+):
+    path = _make_xmind(tmp_path / "thumb.xmind", thumbnail=_png(500, 300))
+    tools = XMindTools(config)
+
+    blocks = await tools.call_tool(
+        "get_preview", {"file_path": str(path), "source": "render", "max_side": 900}
+    )
+    images = [b for b in blocks if getattr(b, "type", "") == "image"]
+    assert len(images) == 1
+    assert "自绘预览" in blocks[0].text
+    width, height = Image.open(io.BytesIO(base64.b64decode(images[0].data))).size
+    assert width != 500 or height != 300
 
 
 async def test_read_all_inlines_images_by_default(config: Config, tmp_path: Path):

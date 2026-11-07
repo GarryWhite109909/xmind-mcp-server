@@ -31,6 +31,9 @@ XMind MCP Server 是一个基于 [Model Context Protocol (MCP)](https://modelcon
 
 另外 `get_preview` 会把 XMind 保存时生成的整图缩略图返回给模型——这是 XMind 自己渲染的画面，
 比任何自绘示意都接近用户在软件里看到的效果，适合让模型先看一眼整体版式和配色。
+文件没有缩略图时（例如本工具新建或改过的文件），它会用 matplotlib 现画一张近似图：
+主题框、文字、分支连线和配色都有，但不含边界、概要、关系线和图片内容。
+也可以用 `source=render` 强制自绘、`sheet=N` 指定看哪一张工作表。
 
 ### 2. 既能读，也能写
 
@@ -207,7 +210,7 @@ xmind-mcp
 | `read_all`        | 节点树 + 图片 + notes/labels/markers/超链接/样式元数据，支持 `max_depth` / `max_nodes` / `image_mode` 防爆上下文 |
 | `list_images`     | 列出所有含图片的节点                                                                       |
 | `get_image`       | 读取节点原图并作为图片返回（多模态模型首选），可选同时返回 OCR 文本                                        |
-| `get_preview`     | 返回 XMind 自带的整图缩略图，看整体版式和配色                                                     |
+| `get_preview`     | 返回整图预览：优先 XMind 自带缩略图，没有就自绘近似图（`source`/`sheet` 可控）                     |
 | `read_image_ocr`  | 对指定节点的图片做 OCR                                                                    |
 | `find_node`       | 按标题关键词搜索节点，返回 ID 和路径                                                             |
 | `get_node`        | 读取单个节点完整信息（含主题类型、节点自身样式、主题继承样式、超链接、父节点）                                          |
@@ -377,9 +380,9 @@ $$
 
 > 先看一眼 `D:\docs\操作系统.xmind` 现在的样子，然后把颜色改柔和一点。
 
-模型会调用 `get_preview` 拿到整图判断当前配色和版式（文件需由 XMind 保存过才有缩略图），
-再用 `analyze_style` 看具体色值，最后 `set_theme_style` / `apply_style_preset` 调整并保存。
-保存会移除旧缩略图，避免预览显示过期画面。
+模型会调用 `get_preview` 拿到整图判断当前配色和版式（优先用 XMind 保存的缩略图，
+没有时自绘一张），再用 `analyze_style` 看具体色值，最后 `set_theme_style` /
+`apply_style_preset` 调整并保存。保存会移除旧缩略图，避免预览显示过期画面。
 
 ### 例 10：把截图/照片转成导图
 
