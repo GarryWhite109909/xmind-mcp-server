@@ -36,6 +36,7 @@ content.json 结构：
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import re
@@ -99,6 +100,8 @@ class XMindFile:
     zip_namelist: list[str]
     # 原始 zip 内容缓存（用于写回时保留未修改的资源）
     _zip_bytes: Optional[bytes] = field(default=None, repr=False)
+    # 解析时文件的 SHA256，保存前用于发现“别人改过这个文件”
+    source_digest: str = ""
 
     def all_topics(self) -> list[TopicNode]:
         """遍历所有工作表的所有节点。"""
@@ -356,6 +359,7 @@ def parse_xmind(file_path: Union[str, Path]) -> XMindFile:
         raw_content=content_raw,
         zip_namelist=namelist,
         _zip_bytes=zip_bytes,
+        source_digest=hashlib.sha256(zip_bytes).hexdigest(),
     )
 
 

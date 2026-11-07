@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from xmind_mcp.xmind_parser import parse_xmind, load_topic_image
-from xmind_mcp.xmind_writer import XMindWriter
+from xmind_mcp.xmind_writer import FileChangedError, XMindWriter
 
 
 def test_add_node_to_root(sample_xmind: Path):
@@ -706,3 +706,37 @@ def test_removed_attachment_also_leaves_manifest(tmp_path: Path):
         saved_manifest = json.loads(zf.read("manifest.json"))
     assert "attachments/images/unused.png" not in names
     assert "attachments/images/unused.png" not in saved_manifest["file-entries"]
+
+
+def test_save_detects_external_change(sample_xmind: Path):
+    """解析之后文件被别人改过，保存必须中止，不能覆盖对方。"""
+    writer = XMindWriter(parse_xmind(sample_xmind))
+    writer.update_node("child-1", title="内存里的修改")
+
+    sample_xmind.write_bytes(b"another process wrote this")
+
+    with pytest.raises(FileChangedError):
+        writer.save()
+    assert sample_xmind.read_bytes() == b"another process wrote this"
+
+
+def test_save_as_works_after_external_change(sample_xmind: Path, tmp_path: Path):
+    """冲突时另存到新文件仍然允许，避免用户的修改无处可去。"""
+    writer = XMindWriter(parse_xmind(sample_xmind))
+    writer.update_node("child-1", title="内存里的修改")
+    sample_xmind.write_bytes(b"another process wrote this")
+
+    out = writer.save(tmp_path / "copy.xmind")
+    assert Path(out).exists()
+    restored = parse_xmind(out)
+    assert restored.find_topic("child-1").title == "内存里的修改"
+
+
+def test_save_twice_is_not_a_conflict(sample_xmind: Path):
+    """自己刚写过的文件不能被误判成外部修改。"""
+    writer = XMindWriter(parse_xmind(sample_xmind))
+    writer.update_node("child-1", title="第一次")
+    writer.save()
+    writer.update_node("child-1", title="第二次")
+    writer.save()
+    assert parse_xmind(sample_xmind).find_topic("child-1").title == "第二次"

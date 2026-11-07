@@ -112,6 +112,18 @@ DEFAULT_METADATA: dict = {
     "creator": {"name": "xmind-mcp", "version": __version__},
 }
 
+class FileChangedError(RuntimeError):
+    """保存前发现文件已被其他程序修改，拒绝覆盖。"""
+
+
+def file_digest(path: str) -> Optional[str]:
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
 # XMind 保存时生成的整图缩略图。本工具改完 content.json 后它就过期了，
 # 原样带回去会让文件管理器 / get_preview 显示旧画面，所以保存时主动移除，
 # 由 XMind 下次打开并保存时重新生成。
@@ -1310,6 +1322,13 @@ class XMindWriter:
         original_path = self.xm.path
         overwriting = os.path.abspath(output_path) == os.path.abspath(original_path)
         if overwriting and Path(original_path).exists():
+            # 解析之后文件被别人（XMind 本体、另一个 MCP 进程）改过时，
+            # 直接覆盖会静默丢掉对方的修改，这里宁可报错让调用方决策。
+            current = file_digest(original_path)
+            if self.xm.source_digest and current and current != self.xm.source_digest:
+                raise FileChangedError(
+                    f"文件在你编辑期间被其他程序修改过，已中止保存以免覆盖对方的改动: {original_path}"
+                )
             _backup_file(original_path)
 
         # 序列化修改后的 content.json
@@ -1400,6 +1419,8 @@ class XMindWriter:
         # 用户后续“保存原文件”会静默写到别处。
         if overwriting:
             self.xm.path = output_path
+            # 刚写入的内容就是新的基准，否则下一次保存会误判为冲突
+            self.xm.source_digest = hashlib.sha256(self.xm._zip_bytes).hexdigest()
 
         return output_path
 

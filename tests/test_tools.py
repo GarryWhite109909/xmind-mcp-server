@@ -727,3 +727,17 @@ async def test_allowed_roots_empty_means_unrestricted(sample_xmind: Path):
         "read_structure", {"file_path": str(sample_xmind)}
     )
     assert err is False
+
+
+async def test_save_file_reports_conflict(config: Config, sample_xmind: Path):
+    tools = XMindTools(config)
+    _, writer = tools.workspace.get(str(sample_xmind))
+    writer.update_node("child-1", title="内存里的修改")
+    sample_xmind.write_bytes(b"another process wrote this")
+
+    blocks, _ = await tools.call_tool_status(
+        "save_file", {"file_path": str(sample_xmind)}
+    )
+    assert "被其他程序修改" in blocks[0].text
+    assert "另存" in blocks[0].text
+    assert sample_xmind.read_bytes() == b"another process wrote this"

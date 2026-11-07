@@ -80,11 +80,30 @@ from .xmind_parser import (
     TopicNode,
 )
 from .xmind_props import THEME_LEVELS
-from .xmind_writer import XMindWriter, list_backups, restore_backup
+from .xmind_writer import (
+    FileChangedError,
+    XMindWriter,
+    file_digest,
+    list_backups,
+    restore_backup,
+)
 from .ocr.manager import OCRManager
 
 
 # ---------- 文件缓存 ----------
+
+def _has_unsaved_changes(xm: XMindFile) -> bool:
+    """内存里的 content 是否与最近一次读写的 zip 不同。"""
+    if not xm._zip_bytes:
+        return False
+    try:
+        with zipfile.ZipFile(io.BytesIO(xm._zip_bytes)) as zf:
+            baseline = json.loads(zf.read("content.json"))
+    except (KeyError, json.JSONDecodeError, zipfile.BadZipFile):
+        return False
+    normalize = lambda data: json.dumps(data, sort_keys=True, ensure_ascii=False)  # noqa: E731
+    return normalize(baseline) != normalize(xm.raw_content)
+
 
 class XMindWorkspace:
     """缓存已解析的 XMind 文件，避免每次工具调用都重新解析。"""
@@ -104,10 +123,32 @@ class XMindWorkspace:
             if cached and cached[0] == mtime:
                 return cached[1], cached[2]
 
+            if cached:
+                disk_digest = file_digest(path)
+                if disk_digest and disk_digest == cached[1].source_digest:
+                    # 内容没变，只是 mtime 变了（touch、同步盘等），继续用缓存
+                    self._cache[path] = (mtime, cached[1], cached[2])
+                    return cached[1], cached[2]
+                if disk_digest and _has_unsaved_changes(cached[1]):
+                    # 磁盘变了 + 内存里有未保存的修改：重新解析会静默丢掉用户的编辑
+                    raise FileChangedError(
+                        f"文件已被其他程序修改，而当前会话还有未保存的修改: {path}\n"
+                        "请先用 save_file(output_path='新路径.xmind') 另存你的修改，再重新读取文件。"
+                    )
+
             xm = parse_xmind(path)
             writer = XMindWriter(xm)
             self._cache[path] = (mtime, xm, writer)
             return xm, writer
+
+    def get_cached(self, path: str) -> Optional[tuple[XMindFile, XMindWriter]]:
+        """取缓存里的实例，不检查磁盘。
+
+        只给保存用：文件被外部改过时，用户仍需要能把内存里的修改另存出去。
+        """
+        with self._lock:
+            cached = self._cache.get(os.path.abspath(path))
+            return (cached[1], cached[2]) if cached else None
 
     def invalidate(self, path: str) -> None:
         with self._lock:
@@ -1222,6 +1263,8 @@ class XMindTools:
         try:
             result = await handler(self, arguments)
             return _content_blocks(result), False
+        except FileChangedError as e:
+            return [_text_block(f"❌ {e}")], True
         except FileNotFoundError as e:
             return [_text_block(f"❌ 文件不存在或路径错误: {e}")], True
         except PermissionError as e:
@@ -1511,14 +1554,10 @@ class XMindTools:
             )
         except ValueError as e:
             return f"❌ {e}"
-        msg = f"✅ 已添加节点：ID={new_node.id}, 标题='{new_node.title}'"
-        if args.get("auto_save"):
-            saved_path = writer.save()
-            self.workspace.refresh_after_save(saved_path)
-            msg += f"\n✅ 已自动保存到: {saved_path}"
-        else:
-            msg += "\n⚠️ 修改未保存，请调用 save_file 或设置 auto_save=true。"
-        return msg
+        return self._auto_save_msg(
+            file_path, writer, args,
+            f"✅ 已添加节点：ID={new_node.id}, 标题='{new_node.title}'",
+        )
 
     async def _update_node(self, args: dict) -> str:
         file_path = args["file_path"]
@@ -1531,14 +1570,9 @@ class XMindTools:
         if not success:
             return f"❌ 找不到节点: {args['node_id']}"
 
-        msg = f"✅ 节点 {args['node_id']} 已更新。"
-        if args.get("auto_save"):
-            saved_path = writer.save()
-            self.workspace.refresh_after_save(saved_path)
-            msg += f"\n✅ 已自动保存到: {saved_path}"
-        else:
-            msg += "\n⚠️ 修改未保存，请调用 save_file 或设置 auto_save=true。"
-        return msg
+        return self._auto_save_msg(
+            file_path, writer, args, f"✅ 节点 {args['node_id']} 已更新。"
+        )
 
     async def _delete_node(self, args: dict) -> str:
         file_path = args["file_path"]
@@ -1551,14 +1585,10 @@ class XMindTools:
         if not success:
             return f"❌ 找不到节点: {args['node_id']}"
 
-        msg = f"✅ 节点 {args['node_id']} 及其子节点已删除。"
-        if args.get("auto_save"):
-            saved_path = writer.save()
-            self.workspace.refresh_after_save(saved_path)
-            msg += f"\n✅ 已自动保存到: {saved_path}"
-        else:
-            msg += "\n⚠️ 修改未保存，请调用 save_file 或设置 auto_save=true。"
-        return msg
+        return self._auto_save_msg(
+            file_path, writer, args,
+            f"✅ 节点 {args['node_id']} 及其子节点已删除。",
+        )
 
     async def _move_node(self, args: dict) -> str:
         file_path = args["file_path"]
@@ -1572,19 +1602,32 @@ class XMindTools:
         if not success:
             return "❌ 移动失败：找不到节点或不能移动根主题。"
 
-        msg = f"✅ 节点 {args['node_id']} 已移动到 {args['new_parent_id']} 下。"
-        if args.get("auto_save"):
-            saved_path = writer.save()
-            self.workspace.refresh_after_save(saved_path)
-            msg += f"\n✅ 已自动保存到: {saved_path}"
-        else:
-            msg += "\n⚠️ 修改未保存，请调用 save_file 或设置 auto_save=true。"
-        return msg
+        return self._auto_save_msg(
+            file_path, writer, args,
+            f"✅ 节点 {args['node_id']} 已移动到 {args['new_parent_id']} 下。",
+        )
 
     async def _save_file(self, args: dict) -> str:
-        xm, writer = self.workspace.get(args["file_path"])
+        file_path = args["file_path"]
+        # 保存必须拿到带未保存修改的那个实例，所以绕过 get() 的冲突检查：
+        # 冲突时覆盖会失败，但另存到新路径要能用。
+        cached = self.workspace.get_cached(file_path)
+        xm, writer = cached if cached else self.workspace.get(file_path)
         output = args.get("output_path")
-        saved_path = writer.save(output)
+        try:
+            saved_path = writer.save(output)
+        except FileChangedError as e:
+            return (
+                f"❌ {e}\n"
+                "你的修改仍在内存中：可以用 save_file(output_path='另一个路径.xmind') 另存，"
+                "或重新读取文件后再改。"
+            )
+        if os.path.abspath(saved_path) != os.path.abspath(file_path):
+            # 另存通常还要继续改原文件，缓存要留着；只有原文件在编辑期间
+            # 被外部改过时，才丢掉这个已经冲突的缓存。
+            current = file_digest(file_path)
+            if current and writer.xm.source_digest and current != writer.xm.source_digest:
+                self.workspace.invalidate(file_path)
         self.workspace.refresh_after_save(saved_path)
         return f"✅ 已保存到: {saved_path}{self._preview_note(writer)}"
 
@@ -2096,11 +2139,17 @@ class XMindTools:
 
     def _auto_save_msg(self, file_path: str, writer: XMindWriter, args: dict, msg: str) -> str:
         """编辑后统一处理保存提示。"""
-        if args.get("auto_save"):
+        if not args.get("auto_save"):
+            return f"{msg}\n⚠️ 修改未保存，请调用 save_file 或设置 auto_save=true。"
+        try:
             saved_path = writer.save()
-            self.workspace.refresh_after_save(saved_path)
-            return f"{msg}\n✅ 已自动保存到: {saved_path}{self._preview_note(writer)}"
-        return f"{msg}\n⚠️ 修改未保存，请调用 save_file 或设置 auto_save=true。"
+        except FileChangedError as e:
+            return (
+                f"{msg}\n❌ 自动保存失败: {e}\n"
+                "修改仍在内存中，可用 save_file(output_path='另一个路径.xmind') 另存。"
+            )
+        self.workspace.refresh_after_save(saved_path)
+        return f"{msg}\n✅ 已自动保存到: {saved_path}{self._preview_note(writer)}"
 
     async def _list_backups(self, args: dict) -> str:
         backups = list_backups(args["file_path"])
