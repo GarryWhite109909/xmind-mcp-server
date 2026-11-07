@@ -56,6 +56,10 @@ def main() -> int:
         help="强制指定推理设备（默认自动检测）",
     )
     parser.add_argument(
+        "--toolset",
+        help="只加载指定工具组（read/edit/style/export/maintenance，可逗号组合；默认 all）",
+    )
+    parser.add_argument(
         "--uninstall",
         action="store_true",
         help="一键卸载：卸载 OCR 依赖、删除模型缓存和配置，可选择同时卸载本包",
@@ -69,6 +73,9 @@ def main() -> int:
     args = parser.parse_args()
 
     config = Config.load()
+    if args.toolset:
+        # 命令行临时覆盖，不写回配置文件
+        config.toolset = args.toolset
 
     # --uninstall：清理所有依赖和本地数据
     if args.uninstall:
@@ -479,6 +486,9 @@ def print_info(config: Config) -> int:
     for g in config.gpus:
         vram = f", 显存: {g.get('vram_mb', 0)}MB" if g.get("vram_mb") else ""
         print(f"  显卡:       {g.get('name', '?')} ({g.get('vendor', '?')}{vram})")
+    print(f"  工具组:     {config.toolset}")
+    roots = ", ".join(config.allowed_roots) if config.allowed_roots else "不限制"
+    print(f"  允许目录:   {roots}")
     print(f"  配置文件:   {CONFIG_FILE}")
     print(f"  已安装包:   {', '.join(config.installed_packages)}")
 

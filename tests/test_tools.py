@@ -9,7 +9,7 @@ import pytest
 
 from xmind_mcp.config import Config
 from xmind_mcp.xmind_parser import parse_xmind
-from xmind_mcp.tools import XMindTools, build_tool_list, format_topic_tree
+from xmind_mcp.tools import TOOLSETS, XMindTools, build_tool_list, format_topic_tree
 
 
 @pytest.fixture
@@ -676,3 +676,54 @@ def test_tool_annotations_mark_read_only_and_destructive():
     assert tools["delete_node"].annotations.destructive_hint is True
     assert tools["set_node_style"].annotations.destructive_hint is False
     assert tools["set_node_style"].annotations.open_world_hint is False
+
+
+def test_toolsets_cover_every_tool_exactly_once():
+    """分组必须覆盖全部工具，且一个工具只属于一组。"""
+    all_names = {t.name for t in build_tool_list()}
+    grouped = [name for group in TOOLSETS.values() for name in group]
+    assert len(grouped) == len(set(grouped)), "同一个工具出现在多个分组里"
+    assert set(grouped) == all_names
+
+
+def test_build_tool_list_filters_by_toolset():
+    read_only = build_tool_list("read")
+    assert {t.name for t in read_only} == TOOLSETS["read"]
+    assert all(t.annotations.read_only_hint for t in read_only)
+
+    combined = build_tool_list("read,export")
+    assert len(combined) == len(TOOLSETS["read"]) + len(TOOLSETS["export"])
+
+    # 写错组名时给全量工具，而不是一个都没有
+    assert len(build_tool_list("不存在的组")) == 57
+    assert len(build_tool_list("all")) == 57
+
+
+async def test_allowed_roots_blocks_outside_paths(tmp_path: Path, sample_xmind: Path):
+    """配置了 allowed_roots 后，目录内的文件可用，目录外直接拒绝。"""
+    config = Config(
+        ocr_engine="rapidocr", device="cpu", initialized=True,
+        allowed_roots=[str(sample_xmind.parent)],
+    )
+    tools = XMindTools(config)
+
+    _, err = await tools.call_tool_status(
+        "read_structure", {"file_path": str(sample_xmind)}
+    )
+    assert err is False
+
+    outside = tmp_path.parent / "definitely_outside.xmind"
+    blocks, err = await tools.call_tool_status(
+        "read_structure", {"file_path": str(outside)}
+    )
+    assert err is True
+    assert "不在允许范围" in blocks[0].text
+
+
+async def test_allowed_roots_empty_means_unrestricted(sample_xmind: Path):
+    """默认不配置 allowed_roots 时保持旧行为。"""
+    tools = XMindTools(Config(ocr_engine="rapidocr", device="cpu", initialized=True))
+    _, err = await tools.call_tool_status(
+        "read_structure", {"file_path": str(sample_xmind)}
+    )
+    assert err is False

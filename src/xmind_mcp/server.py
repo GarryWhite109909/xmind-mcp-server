@@ -72,7 +72,7 @@ async def run_server(config: Config) -> None:
     """启动 MCP Server。"""
     server = Server("xmind-mcp-server")
     tools = XMindTools(config)
-    tool_list = build_tool_list()
+    tool_list = build_tool_list(config.toolset)
 
     # 注册兜底清理：进程正常退出（含 sys.exit）时触发
     atexit.register(_safe_unload, tools, "atexit")

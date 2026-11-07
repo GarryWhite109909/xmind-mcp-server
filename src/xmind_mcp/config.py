@@ -35,6 +35,11 @@ class Config:
     image_mode: str = "inline"
     # 内联图片的长边上限（像素），越大越贵
     image_max_side: int = 1024
+    # 只加载哪些工具组：all（默认）| read | edit | style | export | maintenance
+    # 可组合，如 "read,export"。只读场景建议只留 read，能省掉大部分 schema 开销。
+    toolset: str = "all"
+    # 只允许读写这些目录下的文件（留空 = 不限制，保持旧行为）
+    allowed_roots: list[str] = field(default_factory=list)
     # 是否已完成首次安装
     initialized: bool = False
     # 安装时用的 pip 包列表（用于二次验证）

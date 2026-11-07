@@ -397,6 +397,7 @@ xmind-mcp --setup            # 重新检测硬件并配置
 xmind-mcp --info             # 打印当前硬件和配置信息
 xmind-mcp --engine rapidocr  # 指定 OCR 引擎
 xmind-mcp --device cuda      # 强制指定推理设备
+xmind-mcp --toolset read     # 只加载读工具（可逗号组合，如 read,export）
 xmind-mcp --uninstall        # 一键卸载（依赖 + 模型 + 配置 + 可选本体）
 xmind-mcp --uninstall --yes  # 全自动卸载（含本体，跳过所有确认）
 ```
@@ -423,6 +424,27 @@ xmind-mcp --uninstall --yes   # 全自动：连本包一起卸载，不询问
 5. 询问（或 `--yes` 直接执行）是否同时卸载本包 `xmind-mcp-server` 及其直接依赖 `mcp`、`psutil`、`Pillow`——这些是通用库，可能被其他项目使用，请确认后再删。
 
 卸载失败时退出码非 0，并列出未成功的步骤；非交互环境（无终端输入）默认保留本包，可用 `--yes` 全自动卸载。
+
+***
+
+## 🧩 工具组与路径限制
+
+`~/.xmind-mcp/config.json` 里有两个可选配置：
+
+```json
+{
+  "toolset": "read",
+  "allowed_roots": ["D:\\docs"]
+}
+```
+
+- **`toolset`**：只向客户端暴露指定工具组，减少 `tools/list` 的 schema 开销。
+  可选 `all`（默认）/ `read` / `edit` / `style` / `export` / `maintenance`，支持逗号组合。
+  全量 57 个工具的 schema 约 32KB（粗估 1.1 万 token）；只加载 `read` 组约 5KB（粗估 1900 token）。
+  也可以用 `xmind-mcp --toolset read` 临时覆盖。
+- **`allowed_roots`**：限制可读写的目录，防止模型访问任意路径。
+  留空表示不限制（保持旧行为）；配置后，所有 `*_path` 参数必须落在这些目录内，
+  越界会直接返回错误并提示如何放行。
 
 ***
 

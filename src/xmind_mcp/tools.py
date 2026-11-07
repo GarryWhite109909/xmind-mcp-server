@@ -160,6 +160,30 @@ def _resolve_image_mode(value: Optional[str], config: Config) -> str:
     return mode
 
 
+def _normalize_path(path: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.expanduser(path)))
+
+
+def check_path_allowed(path: str, allowed_roots: list[str]) -> None:
+    """allowed_roots 非空时，路径必须落在其中一个目录内。
+
+    留空表示不限制，保持旧行为——否则升级后所有既有路径都会失效。
+    """
+    if not allowed_roots:
+        return
+    target = _normalize_path(path)
+    for root in allowed_roots:
+        root_path = _normalize_path(root)
+        prefix = root_path if root_path.endswith(os.sep) else root_path + os.sep
+        if target == root_path or target.startswith(prefix):
+            return
+    raise PermissionError(
+        f"路径不在允许范围内: {path}\n"
+        f"当前 allowed_roots = {allowed_roots}。"
+        f"如确需访问，请在 ~/.xmind-mcp/config.json 的 allowed_roots 里加上对应目录。"
+    )
+
+
 def _prepare_image_arg(data: Optional[bytes], max_side) -> Optional[PreparedImage]:
     if not data:
         return None
@@ -387,6 +411,51 @@ def _effective_style(node: TopicNode, xm: XMindFile) -> dict:
 
 # ---------- 工具定义 ----------
 
+# 工具分组：客户端只需要读时，可以只加载其中一组，省掉无关工具的 schema 开销
+TOOLSETS: dict[str, set[str]] = {
+    "read": {
+        "read_structure", "read_all", "list_images", "read_image_ocr",
+        "get_image", "get_preview", "find_node", "get_node",
+        "analyze_file", "analyze_style", "list_sheets",
+    },
+    "edit": {
+        "add_node", "add_nodes", "update_node", "delete_node", "move_node",
+        "duplicate_node", "create_file", "save_file",
+        "import_markdown", "import_markdown_file",
+        "batch_update_titles", "delete_empty_nodes", "merge_duplicate_nodes",
+        "notes_to_children", "children_to_notes", "auto_number",
+        "add_sheet", "rename_sheet", "delete_sheet", "move_sheet",
+    },
+    "style": {
+        "set_node_style", "set_branch_style", "set_theme_style",
+        "set_sheet_layout", "apply_style_preset", "apply_to_matching",
+        "set_hyperlink", "add_image", "add_summary", "add_boundary",
+        "add_relationship", "remove_relationship", "remove_boundary",
+        "add_marker", "remove_marker", "add_label", "remove_label",
+    },
+    "export": {"export_markdown", "export_text", "export_svg"},
+    "maintenance": {
+        "repair_file", "list_backups", "restore_backup",
+        "remove_unused_attachments", "list_attachments", "get_hardware_info",
+    },
+}
+
+
+def resolve_toolset(spec: str) -> Optional[set[str]]:
+    """把 "read,style" 解析成工具名集合。
+
+    all / 空 / 全部无法识别 都返回 None，表示不限制——配置写错时给全量工具，
+    总比一个工具都没有强。
+    """
+    names = [part.strip().lower() for part in str(spec or "").split(",") if part.strip()]
+    if not names or "all" in names:
+        return None
+    selected: set[str] = set()
+    for name in names:
+        selected |= TOOLSETS.get(name, set())
+    return selected or None
+
+
 # 只读工具：不改文件、不写盘，客户端可以放心自动批准
 _READ_ONLY_TOOLS = {
     "read_structure", "read_all", "list_images", "read_image_ocr",
@@ -423,12 +492,12 @@ def _tool(name: str, description: str, properties: dict, required: list[str] = N
     )
 
 
-def build_tool_list() -> list[types.Tool]:
+def build_tool_list(toolset: str = "all") -> list[types.Tool]:
     file_path_prop = {"type": "string", "description": ".xmind 文件路径"}
     md_path_prop = {"type": "string", "description": "要转换的 Markdown 文件路径（.md）"}
     output_xmind_prop = {"type": "string", "description": "生成的 .xmind 文件路径"}
 
-    return [
+    tools = [
         _tool(
             "read_structure",
             "读取 XMind 文件的节点树结构，返回带层级和节点 ID 的文本。支持 max_depth/max_nodes 防止大文件撑爆上下文。",
@@ -1100,6 +1169,11 @@ def build_tool_list() -> list[types.Tool]:
         ),
     ]
 
+    allowed = resolve_toolset(toolset)
+    if allowed is None:
+        return tools
+    return [tool for tool in tools if tool.name in allowed]
+
 
 # ---------- 工具处理 ----------
 
@@ -1115,6 +1189,17 @@ class XMindTools:
         """释放 OCR 模型等资源。"""
         self.ocr.unload()
 
+    def _guard_paths(self, arguments: dict) -> None:
+        """所有以 _path 结尾的参数都受 allowed_roots 约束。"""
+        roots = getattr(self.config, "allowed_roots", None) or []
+        if isinstance(roots, str):  # 配置文件里写成单个字符串也能用
+            roots = [roots]
+        if not roots:
+            return
+        for key, value in arguments.items():
+            if key.endswith("_path") and isinstance(value, str) and value:
+                check_path_allowed(value, roots)
+
     async def call_tool(self, name: str, arguments: dict) -> list:
         messages, _ = await self.call_tool_status(name, arguments)
         return messages
@@ -1128,6 +1213,11 @@ class XMindTools:
         handler = self._handlers.get(name)
         if handler is None:
             return [_text_block(f"未知工具: {name}")], True
+
+        try:
+            self._guard_paths(arguments)
+        except PermissionError as e:
+            return [_text_block(f"❌ {e}")], True
 
         try:
             result = await handler(self, arguments)
