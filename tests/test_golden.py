@@ -195,7 +195,8 @@ def test_writer_structure_shapes_match_real(tmp_path: Path):
 
     child = writer.xm.find_topic(child_id)
     assert set(child._raw["hyperlink"]) == {"link", "title"}
-    assert child._raw["markers"]["markerId"] == ["priority-1"]
+    # 官方格式：markers 是 [{"markerId": "..."}]，xmind-cli validate 会检查
+    assert child._raw["markers"] == [{"markerId": "priority-1"}]
     assert child._raw["labels"] == ["重点"]
     assert "plain" in child._raw["notes"]  # update_node 默认侧边栏备注，plain 是 XMind 兼容子集
 

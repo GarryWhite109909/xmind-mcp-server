@@ -740,3 +740,59 @@ def test_save_twice_is_not_a_conflict(sample_xmind: Path):
     writer.update_node("child-1", title="第二次")
     writer.save()
     assert parse_xmind(sample_xmind).find_topic("child-1").title == "第二次"
+
+
+def _walk_raw(topics):
+    for topic in topics:
+        yield topic
+        children = topic.get("children") or {}
+        for key in ("attached", "detached", "summary", "callout"):
+            yield from _walk_raw(children.get(key) or [])
+
+
+def test_new_topics_follow_xmind_official_schema(sample_xmind: Path):
+    """对齐 xmind-cli validate 的三条硬规则。
+
+    非根主题不能带 class="topic"、每个 style 必须带 id、
+    markers 必须是 [{"markerId": "..."}]。
+    """
+    xm = parse_xmind(sample_xmind)
+    writer = XMindWriter(xm)
+    child_id = xm.sheets[0].root.children[0].id
+
+    new_node = writer.add_node(parent_id="child-1", title="样式与标记")
+    writer.set_node_style(child_id, background_color="#FFF3BF", font_size="18")
+    writer.set_node_style(new_node.id, importance="重要")
+    writer.add_marker(child_id, "priority-1")
+    writer.add_marker(child_id, "task-done")
+    writer.remove_marker(child_id, "priority-1")
+
+    # 落盘后再检查，保存时会给根主题补 class
+    writer.save()
+    saved = parse_xmind(sample_xmind)
+    root = saved.raw_content[0]["rootTopic"]
+    assert root["class"] == "topic"
+    for topic in _walk_raw(root["children"]["attached"]):
+        assert topic.get("class") != "topic"  # minorTopic 等特殊类型可以保留
+
+    child = saved.find_topic(child_id)._raw
+    assert isinstance(child["style"]["id"], str) and child["style"]["id"]
+    assert child["markers"] == [{"markerId": "task-done"}]
+
+    # 重要主题是特殊类型，应保留 class
+    assert saved.find_topic(new_node.id)._raw["class"] == "minorTopic"
+
+
+def test_created_file_follows_xmind_official_schema(tmp_path: Path):
+    path = tmp_path / "created.xmind"
+    writer = XMindWriter.create(
+        path,
+        "根主题",
+        topics=[{"title": "子节点", "children": [{"title": "孙节点"}]}],
+    )
+    xm = parse_xmind(path)
+
+    root = xm.raw_content[0]["rootTopic"]
+    assert root["class"] == "topic"
+    for topic in _walk_raw(root["children"]["attached"]):
+        assert topic.get("class") != "topic"  # minorTopic 等特殊类型可以保留

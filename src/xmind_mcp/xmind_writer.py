@@ -206,6 +206,54 @@ def _ensure_topic_class(topic: dict) -> None:
                 _ensure_topic_class(child)
 
 
+def _ensure_style_id(topic_dict: dict) -> dict:
+    """取（必要时创建）topic 的 style.properties，并保证 style 带 id。
+
+    XMind 官方的结构校验要求每个 style 对象都有 id 字符串；缺 id 的文件
+    仍然能打开，但会被 xmind-cli 报错。
+    """
+    style = topic_dict.get("style")
+    if not isinstance(style, dict):
+        style = {}
+        topic_dict["style"] = style
+    if not style.get("id"):
+        style["id"] = str(uuid.uuid4())
+    props = style.get("properties")
+    if not isinstance(props, dict):
+        props = {}
+        style["properties"] = props
+    return props
+
+
+def _marker_entries(marker_ids) -> list[dict]:
+    """XMind 的 markers 是 [{"markerId": "..."}]（官方校验不接受纯字符串数组）。"""
+    return [{"markerId": marker_id} for marker_id in marker_ids]
+
+
+def _existing_marker_ids(topic_dict: dict) -> list[str]:
+    """读出节点上已有的标记 ID，兼容旧结构（字符串数组 / {"markerId": [...]}）。"""
+    markers = topic_dict.get("markers")
+    if isinstance(markers, dict):
+        markers = markers.get("markerId")
+    ids: list[str] = []
+    if isinstance(markers, list):
+        for entry in markers:
+            if isinstance(entry, dict) and entry.get("markerId"):
+                ids.append(entry["markerId"])
+            elif isinstance(entry, str):
+                ids.append(entry)
+    return ids
+
+
+def _drop_plain_topic_class(topic_dict: dict) -> None:
+    """非根主题不应带 class="topic"（官方校验的要求）。
+
+    importantTopic / minorTopic 等特殊类型保留；只清掉默认的 "topic"。
+    """
+    if topic_dict.get("class") == "topic":
+        topic_dict.pop("class", None)
+
+
 def _backup_file(path: str) -> Optional[str]:
     """覆盖保存前把原文件备份到 ~/.xmind-mcp/backups/，每个文件保留最近 20 份。"""
     try:
@@ -593,13 +641,12 @@ class XMindWriter:
         new_topic = {
             "id": new_id,
             "title": title,
-            "class": "topic",
             "children": {"attached": [], "detached": []},
         }
         if notes:
             new_topic["notes"] = {"plain": {"content": notes}}
         if markers:
-            new_topic["markers"] = {"markerId": markers}
+            new_topic["markers"] = _marker_entries(markers)
 
         attached_list = _ensure_children_attached(parent_dict)
         old_ids = _attached_ids(parent_dict)
@@ -630,7 +677,7 @@ class XMindWriter:
         if notes is not None:
             _set_notes(topic_dict, notes)
         if markers is not None:
-            topic_dict["markers"] = {"markerId": markers}
+            topic_dict["markers"] = _marker_entries(markers)
 
         self.xm.refresh_from_raw()
         return True
@@ -739,7 +786,6 @@ class XMindWriter:
             attached_list.append({
                 "id": new_id,
                 "title": title,
-                "class": "topic",
                 "children": {"attached": [], "detached": []},
             })
             new_ids.append(new_id)
@@ -808,7 +854,7 @@ class XMindWriter:
         importance 设置主题重要程度（极其重要/重要/删去/默认），
         其余参数与 set_node_style 一致（支持中文名、#RRGGBB、#RRGGBBAA、百分比透明度）。
         """
-        topic_dict, _, _ = _find_topic_and_parent(self.xm.raw_content, node_id)
+        topic_dict, parent_dict, _ = _find_topic_and_parent(self.xm.raw_content, node_id)
         if topic_dict is None:
             return False
 
@@ -821,16 +867,11 @@ class XMindWriter:
         updates = _prepare_style_updates(style)
         if new_class is not None:
             topic_dict["class"] = new_class
+            if parent_dict is not None:
+                # 非根主题不能带默认的 "topic"，否则官方校验报错
+                _drop_plain_topic_class(topic_dict)
         if updates:
-            topic_style = topic_dict.get("style")
-            if not isinstance(topic_style, dict):
-                topic_style = {}
-                topic_dict["style"] = topic_style
-            props = topic_style.get("properties")
-            if not isinstance(props, dict):
-                props = {}
-                topic_style["properties"] = props
-            props.update(updates)
+            _ensure_style_id(topic_dict).update(updates)
 
         self.xm.refresh_from_raw()
         return True
@@ -840,15 +881,7 @@ class XMindWriter:
         """把已解析好的样式属性直接写入 topic dict（批量操作内部使用）。"""
         if not updates:
             return
-        topic_style = topic_dict.get("style")
-        if not isinstance(topic_style, dict):
-            topic_style = {}
-            topic_dict["style"] = topic_style
-        props = topic_style.get("properties")
-        if not isinstance(props, dict):
-            props = {}
-            topic_style["properties"] = props
-        props.update(updates)
+        _ensure_style_id(topic_dict).update(updates)
 
     def set_sheet_layout(
         self,
@@ -946,15 +979,7 @@ class XMindWriter:
         if line_pattern is not None:
             updates["line-pattern"] = resolve(BORDER_PATTERNS, line_pattern, label="线条线型")
         if updates:
-            style = topic_dict.get("style")
-            if not isinstance(style, dict):
-                style = {}
-                topic_dict["style"] = style
-            props = style.get("properties")
-            if not isinstance(props, dict):
-                props = {}
-                style["properties"] = props
-            props.update(updates)
+            _ensure_style_id(topic_dict).update(updates)
 
         self.xm.refresh_from_raw()
         return True
@@ -1235,16 +1260,9 @@ class XMindWriter:
     @staticmethod
     def _add_marker_to_topic(topic_dict: dict, marker_id: str) -> None:
         """直接给 topic dict 加标记（批量操作内部使用，不刷新解析树）。"""
-        markers = topic_dict.get("markers")
-        if not isinstance(markers, dict):
-            markers = {"markerId": []}
-            topic_dict["markers"] = markers
-        marker_list = markers.get("markerId")
-        if not isinstance(marker_list, list):
-            marker_list = []
-            markers["markerId"] = marker_list
-        if marker_id not in marker_list:
-            marker_list.append(marker_id)
+        markers = _existing_marker_ids(topic_dict)
+        if marker_id not in markers:
+            topic_dict["markers"] = _marker_entries(markers + [marker_id])
 
     def remove_marker(self, node_id: str, marker_id: str) -> bool:
         """移除节点的指定标记图标。"""
@@ -1259,10 +1277,12 @@ class XMindWriter:
     @staticmethod
     def _remove_marker_from_topic(topic_dict: dict, marker_id: str) -> None:
         """直接移除 topic dict 上的标记（批量操作内部使用，不刷新解析树）。"""
-        markers = topic_dict.get("markers")
-        if isinstance(markers, dict) and isinstance(markers.get("markerId"), list):
-            markers["markerId"] = [m for m in markers["markerId"] if m != marker_id]
-            if not markers["markerId"]:
+        markers = _existing_marker_ids(topic_dict)
+        if marker_id in markers:
+            remaining = [m for m in markers if m != marker_id]
+            if remaining:
+                topic_dict["markers"] = _marker_entries(remaining)
+            else:
                 topic_dict.pop("markers", None)
 
     def add_label(self, node_id: str, label: str) -> bool:
@@ -1330,6 +1350,12 @@ class XMindWriter:
                     f"文件在你编辑期间被其他程序修改过，已中止保存以免覆盖对方的改动: {original_path}"
                 )
             _backup_file(original_path)
+
+        # 根主题按官方格式补上 class="topic"（缺了只是警告，但 XMind 自己保存时都会写）
+        for sheet in self.xm.raw_content:
+            root = sheet.get("rootTopic") if isinstance(sheet, dict) else None
+            if isinstance(root, dict):
+                root.setdefault("class", "topic")
 
         # 序列化修改后的 content.json
         new_content = json.dumps(self.xm.raw_content, ensure_ascii=False, indent=2)
@@ -1664,7 +1690,6 @@ class XMindWriter:
             attached.append({
                 "id": str(uuid.uuid4()),
                 "title": line,
-                "class": "topic",
                 "children": {"attached": [], "detached": []},
             })
         _remap_visual_ranges(topic_dict, old_ids)
@@ -1811,7 +1836,6 @@ class XMindWriter:
             topic = {
                 "id": str(uuid.uuid4()),
                 "title": item.get("title", ""),
-                "class": "topic",
                 "titleUnedited": True,
                 "children": {"attached": [], "detached": []},
             }
@@ -1827,6 +1851,7 @@ class XMindWriter:
             style = item.get("style")
             if isinstance(style, dict) and style.get("properties"):
                 topic["style"] = copy.deepcopy(style)
+                _ensure_style_id(topic)
             if item.get("structureClass"):
                 topic["structureClass"] = item["structureClass"]
             if item.get("extensions"):
@@ -1846,6 +1871,7 @@ class XMindWriter:
             for key in ("structureClass", "extensions", "notesDisplay", "style"):
                 if root_meta.get(key):
                     root_topic[key] = copy.deepcopy(root_meta[key])
+            _ensure_style_id(root_topic)
         content = [sheet]
 
         zip_bytes = io.BytesIO()

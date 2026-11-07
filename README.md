@@ -76,6 +76,11 @@ XMind MCP Server 是一个基于 [Model Context Protocol (MCP)](https://modelcon
 保存时会移除过期的 `Thumbnails/thumbnail.png`（内容已变，旧缩略图会误导预览），
 XMind 下次打开保存时会重新生成。
 
+写入的结构用 XMind 官方的 [`@xmindltd/xmind-cli`](https://github.com/xmindltd/xmind-cli)
+校验过：`create`、`import_markdown`、修改 XMind 原生文件后保存三类产物都是
+0 error / 0 warning。与官方格式对齐的约定（非根主题不写 `class: "topic"`、
+每个 `style` 带 `id`、`markers` 为 `[{"markerId": ...}]`）由单元测试守住。
+
 ### 6. Markdown 公式自动渲染
 
 从 Markdown 导入时，自动识别块级 `$$...$$` 数学公式，用 matplotlib 渲染成图片
