@@ -1,55 +1,7 @@
-"""MCP 工具定义和处理逻辑。
+"""MCP 工具处理器：参数校验、文件缓存、结果格式化。
 
-工具列表：
-  读取类:
-    read_structure    — 读取节点树结构（默认带 ID）
-    read_all          — 读取结构 + 图片 OCR + 节点元数据
-    list_images       — 列出所有含图片的节点
-    read_image_ocr    — 对指定节点的图片做 OCR
-    get_image         — 把节点原图作为图片返回给多模态模型
-    get_preview       — 返回整图预览（XMind 缩略图，缺省时自绘）
-    find_node         — 按关键词搜索节点，返回 ID 和路径
-    get_node          — 读取单个节点的完整信息（含样式、超链接、父节点）
-    analyze_file      — 统计/体检：节点数、深度、重复标题、空节点等
-
-  编辑类:
-    add_node          — 添加子节点
-    add_nodes         — 批量添加子节点
-    update_node       — 更新节点标题/备注
-    delete_node       — 删除节点
-    move_node         — 移动节点到新父节点
-    duplicate_node    — 复制节点（含子树）
-    save_file         — 保存修改
-    create_file       — 从零新建 XMind 文件
-    import_markdown   — 从 Markdown 大纲新建 XMind 文件
-    import_markdown_file — 直接读取 .md 文件，逐行原样转成 XMind（不概括、不精简）
-    repair_file       — 修复打不开的 XMind 文件（补全必需组成部分）
-    apply_to_matching — 按关键词批量设置样式/标记/标签
-
-  美化类:
-    set_node_style    — 设置节点字体/颜色/背景/边框等
-    set_branch_style  — 设置分支连线类型/终点样式/粗细/颜色
-    set_theme_style   — 设置主题级默认样式（中心/分支/细分/自由主题）
-    set_sheet_layout  — 切换工作表的布局结构（顺时针/逻辑图等）
-    apply_style_preset— 一键套用配色预设（清新蓝/暖阳橙/莫兰迪绿）
-    set_hyperlink     — 设置/移除超链接
-    add_image         — 给节点插入图片
-    add_summary       — 给连续子节点区间加概要
-    add_boundary      — 给连续子节点区间加边界
-    add_relationship  — 添加关系线
-    remove_relationship — 删除关系线
-    remove_boundary   — 删除边界
-    add_marker        — 添加标记图标
-    remove_marker     — 移除标记图标
-    add_label         — 添加标签
-    remove_label      — 移除标签
-
-  导出类:
-    export_markdown   — 导出为 Markdown 大纲
-    export_text       — 导出为纯文本大纲
-
-  系统类:
-    get_hardware_info — 获取硬件检测结果
+工具 schema 与分组见 tool_schemas；Markdown 导入见 markdown_import；
+读写细节在 xmind_parser / xmind_writer。
 """
 
 from __future__ import annotations
@@ -58,25 +10,24 @@ import asyncio
 import io
 import json
 import os
-import re
-import sys
-import tempfile
 import threading
 import zipfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from mcp import types
 
-from .config import Config
-from .formula import render_latex_png, try_extract_single_line
-from .hardware.installer import verify_installed
+from .config import Config, normalize_image_mode
 from .image_payload import DEFAULT_MAX_SIDE, PreparedImage, prepare_image
+from .markdown_import import _inject_equations, _parse_markdown_outline
 from .render import render_sheet_png
+from .tool_schemas import _READ_ONLY_TOOLS
 from .xmind_parser import (
     parse_xmind,
     load_preview_image,
     load_topic_image,
+    collect_xap_refs,
+    resolve_xap_entry,
     XMindFile,
     TopicNode,
 )
@@ -88,7 +39,6 @@ from .xmind_writer import (
     list_backups,
     restore_backup,
 )
-from .ocr.manager import OCRManager
 
 
 # ---------- 文件缓存 ----------
@@ -106,6 +56,11 @@ def _has_unsaved_changes(xm: XMindFile) -> bool:
     return normalize(baseline) != normalize(xm.raw_content)
 
 
+def _cache_key(path: str) -> str:
+    """统一缓存键：Windows 下大小写不敏感，避免同一文件缓存两份。"""
+    return os.path.normcase(os.path.abspath(path))
+
+
 class XMindWorkspace:
     """缓存已解析的 XMind 文件，避免每次工具调用都重新解析。"""
 
@@ -116,7 +71,7 @@ class XMindWorkspace:
         self._lock = threading.Lock()
 
     def get(self, path: str) -> tuple[XMindFile, XMindWriter]:
-        path = os.path.abspath(path)
+        path = _cache_key(path)
         mtime = os.path.getmtime(path)
 
         with self._lock:
@@ -148,12 +103,17 @@ class XMindWorkspace:
         只给保存用：文件被外部改过时，用户仍需要能把内存里的修改另存出去。
         """
         with self._lock:
-            cached = self._cache.get(os.path.abspath(path))
+            cached = self._cache.get(_cache_key(path))
             return (cached[1], cached[2]) if cached else None
+
+    def put(self, path: str, xm: XMindFile, writer: XMindWriter) -> None:
+        """把新建/导入得到的实例放入缓存。"""
+        with self._lock:
+            self._cache[_cache_key(path)] = (os.path.getmtime(path), xm, writer)
 
     def invalidate(self, path: str) -> None:
         with self._lock:
-            self._cache.pop(os.path.abspath(path), None)
+            self._cache.pop(_cache_key(path), None)
 
     def refresh_after_save(self, path: str) -> tuple[XMindFile, XMindWriter]:
         """保存后刷新缓存。"""
@@ -163,15 +123,14 @@ class XMindWorkspace:
 
 # ---------- 格式化辅助 ----------
 
-# 单次输出里备注/OCR 文本的最大长度，防止超长内容撑爆模型上下文
+# 单次输出里备注文本的最大长度，防止超长内容撑爆模型上下文
 MAX_NOTE_CHARS = 2000
-MAX_OCR_CHARS = 2000
 
 # 一次读取最多内联多少张图，超出部分只给坐标提示
 MAX_INLINE_IMAGES = 8
 
 # auto 表示“跟随配置”，其余是显式模式
-_IMAGE_MODES = ("off", "ocr", "inline", "both", "auto")
+_IMAGE_MODES = ("off", "inline", "auto")
 
 
 def _text_block(text: str) -> types.TextContent:
@@ -191,14 +150,12 @@ def _content_blocks(result) -> list:
 
 
 def _resolve_image_mode(value: Optional[str], config: Config) -> str:
-    """把 auto 解析成配置里的模式；非法值一律按配置处理。"""
-    mode = (value or "auto").lower()
+    """把 auto 解析成配置里的模式；非法值和旧版 ocr/both 都按 inline 处理。"""
+    mode = str(value or "auto").strip().lower()
     if mode not in _IMAGE_MODES:
         mode = "auto"
     if mode == "auto":
-        mode = (getattr(config, "image_mode", "") or "inline").lower()
-        if mode not in ("off", "ocr", "inline", "both"):
-            mode = "inline"
+        mode = normalize_image_mode(getattr(config, "image_mode", ""))
     return mode
 
 
@@ -240,7 +197,8 @@ def _truncate(text: str, limit: int, hint: str = "已截断") -> str:
 
 
 def _clean_title(title: str) -> str:
-    """清理节点标题中的换行和多余空白。"""
+    """清理节点标题中的换行和多余空白。兼容 JSON 里非字符串的畸形标题。"""
+    title = str(title or "")
     if not title:
         return ""
     return " ".join(title.replace("\r", " ").replace("\n", " ").split())
@@ -310,8 +268,14 @@ def format_topic_tree(
     clean: bool = False,
     max_depth: Optional[int] = None,
     max_nodes: Optional[int] = None,
+    include_metadata: bool = False,
+    include_style: bool = False,
 ) -> str:
-    """把节点树格式化成带缩进的文本。"""
+    """把节点树格式化成带缩进的文本。
+
+    include_metadata=True 时额外输出备注/标签/超链接/主题类型，
+    供 read_all 使用；read_structure 保持原来的精简输出。
+    """
     lines = []
     state = {"nodes": 0, "truncated": False}
     for i, sheet in enumerate(xm.sheets):
@@ -329,6 +293,8 @@ def format_topic_tree(
             max_depth=max_depth,
             max_nodes=max_nodes,
             state=state,
+            include_metadata=include_metadata,
+            include_style=include_style,
         )
     if state["truncated"]:
         lines.append("…（输出已按 max_nodes 截断）")
@@ -346,6 +312,8 @@ def _format_node(
     max_depth: Optional[int],
     max_nodes: Optional[int],
     state: dict,
+    include_metadata: bool = False,
+    include_style: bool = False,
 ) -> None:
     if max_nodes is not None and state["nodes"] >= max_nodes:
         state["truncated"] = True
@@ -355,9 +323,25 @@ def _format_node(
     line = _format_node_line(node, include_ids, show_images, clean)
     lines.append(f"{prefix}{connector}{line}")
 
+    child_prefix = prefix + ("   " if is_last else "│  ")
+    if include_metadata and not clean:
+        if node.notes:
+            notes = _format_multiline(node.notes, child_prefix + "     ")
+            lines.append(f"{child_prefix}   📝 备注: {notes}")
+        if node.labels:
+            lines.append(f"{child_prefix}   🏷️ 标签: {', '.join(node.labels)}")
+        if node.hyperlink:
+            lines.append(f"{child_prefix}   🔗 链接: {node.hyperlink}")
+        if node.xmind_class and node.xmind_class != "topic":
+            lines.append(f"{child_prefix}   📌 主题类型: {node.xmind_class}")
+        if include_style and node.style:
+            props = node.style.get("properties", {})
+            if props:
+                style_text = ", ".join(f"{k}={v}" for k, v in props.items())
+                lines.append(f"{child_prefix}   🎨 样式: {style_text}")
+
     if max_depth is not None and node.level >= max_depth:
         return
-    child_prefix = prefix + ("   " if is_last else "│  ")
     for j, child in enumerate(node.children):
         _format_node(
             child,
@@ -370,6 +354,8 @@ def _format_node(
             max_depth=max_depth,
             max_nodes=max_nodes,
             state=state,
+            include_metadata=include_metadata,
+            include_style=include_style,
         )
 
 
@@ -380,8 +366,8 @@ def _iter_visible_topics(
 ):
     """按输出顺序遍历“会被渲染出来”的节点（与树格式化共用相同的截断规则）。
 
-    供 read_all 决定哪些图片需要 OCR：max_depth/max_nodes 之外的图片
-    不会出现在输出里，也就不必花时间识别。
+    供 read_all 决定要内联哪些图片：max_depth/max_nodes 之外的图片
+    不会出现在输出里，也就不必读取和压缩。
     """
     count = 0
     for sheet in xm.sheets:
@@ -401,15 +387,15 @@ def _iter_visible_topics(
 def _build_node_path(node: TopicNode, xm: XMindFile) -> str:
     """构建节点的标题路径，如 '根主题/分支主题/子节点'。"""
     parts = []
+    seen: set[str] = set()
     current = node
-    while current:
+    while current and current.id not in seen:
+        seen.add(current.id)
         parts.append(_clean_title(current.title) or current.id)
         # 通过 parent_id 在树中查找父节点
         if not current.parent_id:
             break
         current = xm.find_topic(current.parent_id)
-        if current is None or current.id == node.id:
-            break
     return " / ".join(reversed(parts))
 
 
@@ -451,794 +437,17 @@ def _effective_style(node: TopicNode, xm: XMindFile) -> dict:
     return props
 
 
-# ---------- 工具定义 ----------
-
-# 工具分组：客户端只需要读时，可以只加载其中一组，省掉无关工具的 schema 开销
-TOOLSETS: dict[str, set[str]] = {
-    "read": {
-        "read_structure", "read_all", "list_images", "read_image_ocr",
-        "get_image", "get_preview", "find_node", "get_node",
-        "analyze_file", "analyze_style", "list_sheets",
-    },
-    "edit": {
-        "add_node", "add_nodes", "update_node", "delete_node", "move_node",
-        "duplicate_node", "create_file", "save_file",
-        "import_markdown", "import_markdown_file",
-        "batch_update_titles", "delete_empty_nodes", "merge_duplicate_nodes",
-        "notes_to_children", "children_to_notes", "auto_number",
-        "add_sheet", "rename_sheet", "delete_sheet", "move_sheet",
-    },
-    "style": {
-        "set_node_style", "set_branch_style", "set_theme_style",
-        "set_sheet_layout", "apply_style_preset", "apply_to_matching",
-        "set_hyperlink", "add_image", "add_summary", "add_boundary",
-        "add_relationship", "remove_relationship", "remove_boundary",
-        "add_marker", "remove_marker", "add_label", "remove_label",
-    },
-    "export": {"export_markdown", "export_text", "export_svg"},
-    "maintenance": {
-        "repair_file", "list_backups", "restore_backup",
-        "remove_unused_attachments", "list_attachments", "get_hardware_info",
-    },
-}
-
-
-def resolve_toolset(spec: str) -> Optional[set[str]]:
-    """把 "read,style" 解析成工具名集合。
-
-    all / 空 / 全部无法识别 都返回 None，表示不限制——配置写错时给全量工具，
-    总比一个工具都没有强。
-    """
-    names = [part.strip().lower() for part in str(spec or "").split(",") if part.strip()]
-    if not names or "all" in names:
-        return None
-    selected: set[str] = set()
-    for name in names:
-        selected |= TOOLSETS.get(name, set())
-    return selected or None
-
-
-# 只读工具：不改文件、不写盘，客户端可以放心自动批准
-_READ_ONLY_TOOLS = {
-    "read_structure", "read_all", "list_images", "read_image_ocr",
-    "get_image", "get_preview", "find_node", "get_node",
-    "analyze_file", "analyze_style", "export_markdown", "export_text",
-    "list_sheets", "list_attachments", "list_backups", "get_hardware_info",
-}
-
-# 会删除或覆盖既有内容的工具，客户端应向用户确认
-_DESTRUCTIVE_TOOLS = {
-    "delete_node", "delete_sheet",
-    "remove_marker", "remove_label", "remove_boundary", "remove_relationship",
-    "delete_empty_nodes", "merge_duplicate_nodes", "remove_unused_attachments",
-    "batch_update_titles", "restore_backup", "repair_file",
-    "save_file", "create_file",
-}
-
-
-def _tool(name: str, description: str, properties: dict, required: list[str] = None) -> types.Tool:
-    read_only = name in _READ_ONLY_TOOLS
-    return types.Tool(
-        name=name,
-        description=description,
-        inputSchema={
-            "type": "object",
-            "properties": properties,
-            "required": required or [],
-        },
-        annotations=types.ToolAnnotations(
-            read_only_hint=read_only,
-            destructive_hint=None if read_only else name in _DESTRUCTIVE_TOOLS,
-            open_world_hint=False,
-        ),
-    )
-
-
-def build_tool_list(toolset: str = "all") -> list[types.Tool]:
-    file_path_prop = {"type": "string", "description": ".xmind 文件路径"}
-    md_path_prop = {"type": "string", "description": "要转换的 Markdown 文件路径（.md）"}
-    output_xmind_prop = {"type": "string", "description": "生成的 .xmind 文件路径"}
-
-    tools = [
-        _tool(
-            "read_structure",
-            "读取 XMind 文件的节点树结构，返回带层级和节点 ID 的文本。支持 max_depth/max_nodes 防止大文件撑爆上下文。",
-            {
-                "file_path": file_path_prop,
-                "include_ids": {"type": "boolean", "description": "是否在每行后输出节点 ID（默认 true）"},
-                "clean": {"type": "boolean", "description": "是否去掉 📷/📝/🔖 等内部标记（默认 false）"},
-                "max_depth": {"type": "integer", "description": "只输出到该层级（可选，根主题为 L0）"},
-                "max_nodes": {"type": "integer", "description": "最多输出多少个节点，超出截断（可选）"},
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "read_all",
-            "一步到位：读取节点树 + 图片 + notes/labels/markers/超链接/样式元数据。默认把每个图片节点的原图作为图片一起返回（适合多模态模型）；纯文本模型用 image_mode=ocr 只要文字。",
-            {
-                "file_path": file_path_prop,
-                "include_ids": {"type": "boolean", "description": "是否在每行后输出节点 ID（默认 true）"},
-                "clean": {"type": "boolean", "description": "是否去掉 📷/📝/🔖 等内部标记（默认 false）"},
-                "include_style": {"type": "boolean", "description": "是否输出每个节点的样式属性（默认 false）"},
-                "max_depth": {"type": "integer", "description": "只输出到该层级（可选，根主题为 L0）"},
-                "max_nodes": {"type": "integer", "description": "最多输出多少个节点，超出截断（可选）"},
-                "image_mode": {
-                    "type": "string",
-                    "enum": ["auto", "inline", "ocr", "both", "off"],
-                    "description": "图片处理方式：inline=返回原图（默认），ocr=只给识别文字，both=两者，off=都不给",
-                },
-                "max_images": {"type": "integer", "description": "最多内联多少张图（默认 8）"},
-                "image_max_side": {"type": "integer", "description": "内联图片长边上限（默认 1024）"},
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "list_images",
-            "列出 XMind 文件中所有包含图片的节点（ID + 标题 + 图片引用）。",
-            {"file_path": file_path_prop},
-            ["file_path"],
-        ),
-        _tool(
-            "read_image_ocr",
-            "对指定节点的图片做 OCR 识别，返回图片中的文字。需要先用 read_structure 或 list_images 获取 node_id。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "包含图片的节点 ID"},
-            },
-            ["file_path", "node_id"],
-        ),
-        _tool(
-            "get_image",
-            "读取节点的图片本身并作为图片返回，多模态模型可直接看图（图表、截图、手写内容比 OCR 文本准得多）。默认把长边压到 1024、转 JPEG；需要文字时加 include_ocr=true。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "包含图片的节点 ID"},
-                "max_side": {"type": "integer", "description": "长边像素上限（默认 1024）"},
-                "include_ocr": {"type": "boolean", "description": "是否同时返回 OCR 文本（默认 false）"},
-            },
-            ["file_path", "node_id"],
-        ),
-        _tool(
-            "get_preview",
-            "返回整图预览，让模型先看一眼整体版式和配色。优先用 XMind 保存时生成的缩略图（最接近软件里的真实效果）；没有缩略图时自动用 matplotlib 自绘一张近似图。",
-            {
-                "file_path": file_path_prop,
-                "max_side": {"type": "integer", "description": "长边像素上限（默认 1024）"},
-                "source": {
-                    "type": "string",
-                    "enum": ["auto", "embedded", "render"],
-                    "description": "auto=有缩略图用缩略图、没有就自绘（默认）；embedded=只要 XMind 缩略图；render=总是自绘",
-                },
-                "sheet": {
-                    "type": "integer",
-                    "description": "要自绘的工作表索引，从 0 开始（默认 0；缩略图模式下忽略）",
-                },
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "find_node",
-            "按标题关键词搜索节点，返回节点 ID、标题和层级路径，方便编辑工具使用。",
-            {
-                "file_path": file_path_prop,
-                "keyword": {"type": "string", "description": "标题关键词（不区分大小写）"},
-            },
-            ["file_path", "keyword"],
-        ),
-        _tool(
-            "get_node",
-            "读取单个节点的完整信息：标题、层级、类型、父节点、路径、备注、标记、标签、超链接、图片、样式、子节点。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "节点 ID"},
-            },
-            ["file_path", "node_id"],
-        ),
-        _tool(
-            "analyze_file",
-            "对 XMind 文件做统计和体检：节点数、最大深度、备注/图片/标记统计、重复标题、空标题、特殊节点。",
-            {"file_path": file_path_prop},
-            ["file_path"],
-        ),
-        _tool(
-            "add_node",
-            "在指定父节点下添加子节点，可用 before_id/after_id 指定插入到某个兄弟节点前后。",
-            {
-                "file_path": file_path_prop,
-                "parent_id": {"type": "string", "description": "父节点 ID"},
-                "title": {"type": "string", "description": "新节点标题"},
-                "notes": {"type": "string", "description": "节点备注（可选）"},
-                "before_id": {"type": "string", "description": "插到该兄弟节点之前（可选）"},
-                "after_id": {"type": "string", "description": "插到该兄弟节点之后（可选）"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "parent_id", "title"],
-        ),
-        _tool(
-            "update_node",
-            "更新节点属性。传入 None 或省略的字段不会被修改。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "要更新的节点 ID"},
-                "title": {"type": "string", "description": "新标题（可选）"},
-                "notes": {"type": "string", "description": "新备注（可选）"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "node_id"],
-        ),
-        _tool(
-            "delete_node",
-            "删除节点及其所有子节点。不能删除根主题。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "要删除的节点 ID"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "node_id"],
-        ),
-        _tool(
-            "move_node",
-            "把节点移动到新的父节点下，可用 before_id/after_id 指定插入位置。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "要移动的节点 ID"},
-                "new_parent_id": {"type": "string", "description": "新父节点 ID"},
-                "before_id": {"type": "string", "description": "插到该兄弟节点之前（可选）"},
-                "after_id": {"type": "string", "description": "插到该兄弟节点之后（可选）"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "node_id", "new_parent_id"],
-        ),
-        _tool(
-            "save_file",
-            "保存对 XMind 文件的修改。可另存为新文件或覆盖原文件。示例: output_path='D:\\docs\\output.xmind'",
-            {
-                "file_path": {"type": "string", "description": "当前 .xmind 文件路径"},
-                "output_path": {"type": "string", "description": "另存为的路径（可选，省略则覆盖原文件）"},
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "repair_file",
-            "修复打不开的 XMind 文件：自动补全 metadata.json、content.xml、默认主题、revisionId 等 XMind 必需内容；若 content.json 缺失或损坏，会重建空白画布并保留 zip 内的附件资源。覆盖保存前会自动备份原文件。",
-            {
-                "file_path": file_path_prop,
-                "output_path": {"type": "string", "description": "修复后另存的路径（可选，省略则覆盖原文件）"},
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "export_markdown",
-            "把 XMind 节点树导出为 Markdown 大纲。",
-            {
-                "file_path": file_path_prop,
-                "include_ids": {"type": "boolean", "description": "是否在标题后附加 ID（默认 false）"},
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "create_file",
-            "从零新建一个 XMind 文件。topics 为嵌套结构：[{\"title\": \"...\", \"notes\": \"...\", \"children\": [...]}]。",
-            {
-                "file_path": file_path_prop,
-                "root_title": {"type": "string", "description": "根主题标题"},
-                "sheet_title": {"type": "string", "description": "工作表标题（可选，默认 画布 1）"},
-                "topics": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "title": {"type": "string"},
-                            "notes": {"type": "string"},
-                            "children": {"type": "array", "items": {"type": "object"}},
-                        },
-                    },
-                    "description": "根主题下的子节点（可选）",
-                },
-            },
-            ["file_path", "root_title"],
-        ),
-        _tool(
-            "import_markdown",
-            "把传入的 Markdown 文本逐行原样转成新的 XMind 文件：所有文字（标题、列表、表格、代码块、引用）都会保留，不做概括或精简。必须把完整原文传给 markdown 参数；如果 Markdown 在磁盘上，请改用 import_markdown_file。",
-            {
-                "file_path": file_path_prop,
-                "markdown": {"type": "string", "description": "Markdown 完整原文，禁止先概括或精简"},
-                "sheet_title": {"type": "string", "description": "工作表标题（可选，默认用第一个标题）"},
-            },
-            ["file_path", "markdown"],
-        ),
-        _tool(
-            "import_markdown_file",
-            "直接读取磁盘上的 Markdown 文件并逐行原样转成新的 XMind 文件：所有文字（标题、列表、表格、代码块、引用）都会保留，不做概括或精简。模型只需传文件路径，不要自行改写内容。",
-            {
-                "file_path": md_path_prop,
-                "output_path": output_xmind_prop,
-                "sheet_title": {"type": "string", "description": "工作表标题（可选，默认用第一个标题）"},
-            },
-            ["file_path", "output_path"],
-        ),
-        _tool(
-            "apply_to_matching",
-            "按标题关键词批量修改节点：设置样式、添加/移除标记、添加/移除标签。",
-            {
-                "file_path": file_path_prop,
-                "keyword": {"type": "string", "description": "标题包含的关键词（不区分大小写）"},
-                "style": {
-                    "type": "object",
-                    "description": "要设置的样式（可选），键与 set_node_style 一致",
-                    "properties": {
-                        "font_color": {"type": "string"},
-                        "font_size": {"type": "string"},
-                        "font_family": {"type": "string"},
-                        "font_weight": {"type": "string"},
-                        "font_style": {"type": "string"},
-                        "font_transform": {"type": "string"},
-                        "font_decoration": {"type": "string"},
-                        "background_color": {"type": "string"},
-                        "fill_pattern": {"type": "string"},
-                        "border_color": {"type": "string"},
-                        "border_width": {"type": "string"},
-                        "border_pattern": {"type": "string"},
-                        "shape": {"type": "string"},
-                        "line_color": {"type": "string"},
-                        "line_width": {"type": "string"},
-                        "line_pattern": {"type": "string"},
-                        "text_align": {"type": "string"},
-                        "importance": {"type": "string"},
-                    },
-                },
-                "add_markers": {"type": "array", "items": {"type": "string"}, "description": "要添加的标记 ID 列表"},
-                "remove_markers": {"type": "array", "items": {"type": "string"}, "description": "要移除的标记 ID 列表"},
-                "add_labels": {"type": "array", "items": {"type": "string"}, "description": "要添加的标签列表"},
-                "remove_labels": {"type": "array", "items": {"type": "string"}, "description": "要移除的标签列表"},
-                "preview": {"type": "boolean", "description": "只返回将影响的节点，不实际修改（默认 false）"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "keyword"],
-        ),
-        _tool(
-            "export_text",
-            "把 XMind 节点树导出为纯文本大纲（带缩进层级）。",
-            {
-                "file_path": file_path_prop,
-                "include_ids": {"type": "boolean", "description": "是否在每行后输出节点 ID（默认 false）"},
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "set_node_style",
-            "设置节点样式：重要程度（极其重要/重要/删去/默认）、字体、字号（8/10/12/14/18/24/36/48/60）、文字颜色、加粗/斜体/删除线/下划线/大小写变换、背景色、边框色/线型/宽度、节点形状（矩形/圆角矩形/下划线/双下划线/圆形/椭圆形/菱形/平行四边形/跑道/切角矩形/六边形/竖胶囊）、连线颜色/线宽、对齐。传 None 表示不修改该项。颜色用 #RRGGBB、#RRGGBBAA 或「4E0D58 60%」透明度写法。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "要设置样式的节点 ID"},
-                "importance": {"type": "string", "description": "重要程度：极其重要 / 重要 / 删去 / 默认"},
-                "font_color": {"type": "string", "description": "文字颜色，如 #FF0000 或 4E0D58 60%"},
-                "font_size": {"type": "string", "description": "字号：8 / 10 / 12 / 14 / 18 / 24 / 36 / 48 / 60 或 16pt"},
-                "font_family": {"type": "string", "description": "字体族，如 Arial / 微软雅黑"},
-                "font_weight": {"type": "string", "description": "加粗：加粗 / 正常（或 bold / normal）"},
-                "font_style": {"type": "string", "description": "斜体：斜体 / 正常（或 italic / normal）"},
-                "font_transform": {"type": "string", "description": "大小写：默认 / 全大写 / 全小写 / 首字母大写"},
-                "font_decoration": {"type": "string", "description": "文字装饰：下划线 / 删除线 / 无，可叠加如「下划线+删除线」"},
-                "background_color": {"type": "string", "description": "背景色，如 #FFF3BF 或 4E0D58 60%"},
-                "fill_pattern": {"type": "string", "description": "填充样式：无 / 纯色 / 手绘 / 交叉线 / 细交叉线 / 影线 / 细影线"},
-                "border_color": {"type": "string", "description": "边框色，如 #000000"},
-                "border_width": {"type": "string", "description": "边框宽度：极细 / 细 / 中等 / 粗 / 极粗，或 2pt"},
-                "border_pattern": {"type": "string", "description": "边框线型：实线 / 虚线 / 点线 / 点划线 / 无"},
-                "shape": {"type": "string", "description": "节点形状：矩形 / 圆角矩形 / 下划线 / 双下划线 / 圆形 / 椭圆形 / 菱形 / 平行四边形 / 跑道 / 切角矩形 / 六边形 / 竖胶囊"},
-                "line_color": {"type": "string", "description": "分支连线颜色，如 #FF6B6B"},
-                "line_width": {"type": "string", "description": "分支连线宽度：极细 / 细 / 中等 / 粗 / 极粗，或 2pt"},
-                "line_pattern": {"type": "string", "description": "连线线型：实线 / 虚线 / 点线 / 点划线 / 无"},
-                "text_align": {"type": "string", "description": "对齐：左对齐 / 居中 / 右对齐 / 默认"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "node_id"],
-        ),
-        _tool(
-            "set_sheet_layout",
-            "切换工作表的布局结构，支持中文名：思维导图 / 逻辑图 / 括号图 / 组织结构图 / 树形图 / 时间轴 / 鱼骨图 / 矩阵图 / 树型表格，也支持 XMind 内部 ID。",
-            {
-                "file_path": file_path_prop,
-                "sheet_index": {"type": "integer", "description": "工作表索引，从 0 开始（默认 0）"},
-                "layout": {"type": "string", "description": "布局结构（默认 思维导图）"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "set_branch_style",
-            "设置某个节点向外分支的连线样式：分支类型（圆角折线/折线/直线/曲线/圆弧/手绘/圆角手绘）、终点样式（圆点/三角形/菱形/双箭头等）、粗细（极细/细/中等/粗/极粗）、颜色、线型。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "要设置分支样式的节点 ID"},
-                "line_type": {"type": "string", "description": "分支类型：圆角折线 / 折线 / 直线 / 曲线 / 圆弧 / 手绘 / 圆角手绘"},
-                "arrow_end": {"type": "string", "description": "终点样式：无 / 圆点 / 三角形 / 矛头 / 方形 / 菱形 / 鱼骨 / 双箭头 / 反三角 / 附着 / 钩形"},
-                "line_color": {"type": "string", "description": "连线颜色，如 #FF6B6B 或 4E0D58 60%"},
-                "line_width": {"type": "string", "description": "线宽：极细 / 细 / 中等 / 粗 / 极粗，或 2pt"},
-                "line_pattern": {"type": "string", "description": "线型：实线 / 虚线 / 点线 / 点划线 / 无"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "node_id"],
-        ),
-        _tool(
-            "set_theme_style",
-            "设置主题级默认样式，影响整个层级的节点：中心主题 / 分支主题 / 第三层级主题 / 细分主题 / 自由主题。参数与 set_node_style 一致（font_color、font_size、shape、background_color 等，不含 importance）。",
-            {
-                "file_path": file_path_prop,
-                "sheet_index": {"type": "integer", "description": "工作表索引，从 0 开始（默认 0）"},
-                "level": {"type": "string", "description": "主题层级：中心主题 / 分支主题 / 第三层级主题 / 细分主题 / 自由主题"},
-                "font_color": {"type": "string"},
-                "font_size": {"type": "string"},
-                "font_family": {"type": "string"},
-                "font_weight": {"type": "string"},
-                "font_style": {"type": "string"},
-                "font_transform": {"type": "string"},
-                "font_decoration": {"type": "string"},
-                "background_color": {"type": "string"},
-                "fill_pattern": {"type": "string"},
-                "border_color": {"type": "string"},
-                "border_width": {"type": "string"},
-                "border_pattern": {"type": "string"},
-                "shape": {"type": "string"},
-                "line_color": {"type": "string"},
-                "line_width": {"type": "string"},
-                "line_pattern": {"type": "string"},
-                "text_align": {"type": "string"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "add_image",
-            "给节点插入一张本地图片（复制进 xmind 包并更新引用，支持 png/jpg/gif/bmp/webp）。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "要插入图片的节点 ID"},
-                "image_path": {"type": "string", "description": "本地图片的绝对路径"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "node_id", "image_path"],
-        ),
-        _tool(
-            "add_summary",
-            "给父节点的连续子节点区间添加概要（summary）。start_id/end_id 必须是父节点的直属子节点。",
-            {
-                "file_path": file_path_prop,
-                "parent_id": {"type": "string", "description": "父节点 ID"},
-                "start_id": {"type": "string", "description": "区间起点子节点 ID"},
-                "end_id": {"type": "string", "description": "区间终点子节点 ID"},
-                "title": {"type": "string", "description": "概要文字（可选，默认 概要）"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "parent_id", "start_id", "end_id"],
-        ),
-        _tool(
-            "add_boundary",
-            "给父节点的连续子节点区间添加边界（boundary）。start_id/end_id 必须是父节点的直属子节点。",
-            {
-                "file_path": file_path_prop,
-                "parent_id": {"type": "string", "description": "父节点 ID"},
-                "start_id": {"type": "string", "description": "区间起点子节点 ID"},
-                "end_id": {"type": "string", "description": "区间终点子节点 ID"},
-                "title": {"type": "string", "description": "边界标题（可选）"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "parent_id", "start_id", "end_id"],
-        ),
-        _tool(
-            "add_relationship",
-            "在指定工作表中添加一条关系线（relationship），连接两个任意节点。",
-            {
-                "file_path": file_path_prop,
-                "start_id": {"type": "string", "description": "起点节点 ID"},
-                "end_id": {"type": "string", "description": "终点节点 ID"},
-                "sheet_index": {"type": "integer", "description": "工作表索引（默认 0）"},
-                "title": {"type": "string", "description": "关系线文字（可选）"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "start_id", "end_id"],
-        ),
-        _tool(
-            "remove_relationship",
-            "按 ID 删除一条关系线。",
-            {
-                "file_path": file_path_prop,
-                "relationship_id": {"type": "string", "description": "关系线 ID"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "relationship_id"],
-        ),
-        _tool(
-            "remove_boundary",
-            "按 ID 删除一个边界。",
-            {
-                "file_path": file_path_prop,
-                "boundary_id": {"type": "string", "description": "边界 ID"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "boundary_id"],
-        ),
-        _tool(
-            "apply_style_preset",
-            "一键给整张图套用配色预设。可选：清新蓝、暖阳橙、莫兰迪绿。",
-            {
-                "file_path": file_path_prop,
-                "preset": {
-                    "type": "string",
-                    "enum": ["清新蓝", "暖阳橙", "莫兰迪绿"],
-                    "description": "配色预设名称",
-                },
-                "preview": {"type": "boolean", "description": "只返回将影响的节点统计，不实际修改（默认 false）"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "preset"],
-        ),
-        _tool(
-            "set_hyperlink",
-            "给节点设置超链接。url 为空则移除超链接。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "要设置超链接的节点 ID"},
-                "url": {"type": "string", "description": "链接地址，如 https://example.com，为空则移除"},
-                "title": {"type": "string", "description": "链接显示标题（可选，默认用 url）"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "node_id", "url"],
-        ),
-        _tool(
-            "add_marker",
-            "给节点添加标记图标。常用：priority-1~9（优先级）、task-start/task-oct/task-quarter/task-half/task-3q/task-done/task-pause（任务进度）、smiley-*、flag-*、star-*。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "要添加标记的节点 ID"},
-                "marker_id": {"type": "string", "description": "标记 ID，如 priority-1、task-done"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "node_id", "marker_id"],
-        ),
-        _tool(
-            "remove_marker",
-            "移除节点的指定标记图标。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "节点 ID"},
-                "marker_id": {"type": "string", "description": "要移除的标记 ID"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "node_id", "marker_id"],
-        ),
-        _tool(
-            "add_label",
-            "给节点添加一个标签。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "节点 ID"},
-                "label": {"type": "string", "description": "标签文本"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "node_id", "label"],
-        ),
-        _tool(
-            "remove_label",
-            "移除节点的一个标签。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "节点 ID"},
-                "label": {"type": "string", "description": "要移除的标签文本"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "node_id", "label"],
-        ),
-        _tool(
-            "add_nodes",
-            "批量添加多个子节点到指定父节点下。",
-            {
-                "file_path": file_path_prop,
-                "parent_id": {"type": "string", "description": "父节点 ID"},
-                "titles": {"type": "array", "items": {"type": "string"}, "description": "要添加的子节点标题列表"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "parent_id", "titles"],
-        ),
-        _tool(
-            "duplicate_node",
-            "把节点（含其整棵子树）复制到新父节点下，生成新的 ID。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "要复制的节点 ID"},
-                "new_parent_id": {"type": "string", "description": "目标父节点 ID"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "node_id", "new_parent_id"],
-        ),
-        _tool(
-            "get_hardware_info",
-            "获取当前机器的硬件检测结果和 OCR 引擎配置信息。",
-            {},
-            [],
-        ),
-        _tool(
-            "list_backups",
-            "列出某个 xmind 文件已有的自动备份（新到旧），包含路径、大小和时间。",
-            {"file_path": file_path_prop},
-            ["file_path"],
-        ),
-        _tool(
-            "restore_backup",
-            "把指定备份恢复到目标文件（覆盖前会把当前文件再备份一份，保证可逆）。",
-            {
-                "file_path": file_path_prop,
-                "backup_path": {"type": "string", "description": "要恢复的备份文件路径，可用 list_backups 获取"},
-            },
-            ["file_path", "backup_path"],
-        ),
-        _tool(
-            "export_svg",
-            "把节点树导出为示意图 SVG 文件（用于人工查看美化效果；模型可继续用 analyze_style 获取结构化反馈）。",
-            {
-                "file_path": file_path_prop,
-                "output_path": {"type": "string", "description": "SVG 输出路径（可选，默认与源文件同名的 .svg）"},
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "analyze_style",
-            "样式审计：输出当前工作表各主题层级的默认样式、整张图的颜色/字体/形状使用统计，可选列出每个节点的有效样式。",
-            {
-                "file_path": file_path_prop,
-                "sheet_index": {"type": "integer", "description": "工作表索引（默认 0）"},
-                "include_node_styles": {"type": "boolean", "description": "是否列出节点级有效样式（默认 false）"},
-                "max_nodes": {"type": "integer", "description": "include_node_styles 时最多列出多少个节点（默认 50）"},
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "list_attachments",
-            "列出 xmind 包内的附件/图片资源，标注哪些被节点引用、哪些未被引用。",
-            {"file_path": file_path_prop},
-            ["file_path"],
-        ),
-        _tool(
-            "remove_unused_attachments",
-            "找出未被任何节点引用的附件/图片，保存时移除，减小文件体积。",
-            {
-                "file_path": file_path_prop,
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "batch_update_titles",
-            "按关键词或正则批量替换节点标题，返回被修改的节点。",
-            {
-                "file_path": file_path_prop,
-                "find": {"type": "string", "description": "要查找的文本或正则表达式"},
-                "replace": {"type": "string", "description": "替换为的文本"},
-                "use_regex": {"type": "boolean", "description": "是否把 find 当作正则表达式（默认 false）"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "find", "replace"],
-        ),
-        _tool(
-            "delete_empty_nodes",
-            "删除所有空标题的普通节点（含其子树），跳过根主题和概要/批注节点。",
-            {
-                "file_path": file_path_prop,
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "merge_duplicate_nodes",
-            "合并标题相同的兄弟节点：保留第一个，其余节点的子节点并入后删除。",
-            {
-                "file_path": file_path_prop,
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "notes_to_children",
-            "把节点备注的每一行转成一个子节点（默认转换后清空备注）。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "要转换的节点 ID"},
-                "keep_notes": {"type": "boolean", "description": "转换后是否保留原备注（默认 false）"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "node_id"],
-        ),
-        _tool(
-            "children_to_notes",
-            "把节点的直接子节点标题合并成备注（默认转换后删除子节点）。",
-            {
-                "file_path": file_path_prop,
-                "node_id": {"type": "string", "description": "要转换的节点 ID"},
-                "keep_children": {"type": "boolean", "description": "转换后是否保留子节点（默认 false）"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "node_id"],
-        ),
-        _tool(
-            "auto_number",
-            "给节点自动编号：decimal 按每个父节点 1.2.3. 编号；hierarchical 按 1. / 1.1. / 1.1.1. 层级编号。已有编号会被替换。",
-            {
-                "file_path": file_path_prop,
-                "mode": {"type": "string", "enum": ["decimal", "hierarchical"], "description": "编号方式（默认 decimal）"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "list_sheets",
-            "列出文件中的所有工作表：索引、标题、根主题、节点数。",
-            {"file_path": file_path_prop},
-            ["file_path"],
-        ),
-        _tool(
-            "add_sheet",
-            "新增一张工作表。",
-            {
-                "file_path": file_path_prop,
-                "title": {"type": "string", "description": "工作表标题（可选，默认 画布）"},
-                "root_title": {"type": "string", "description": "根主题标题（可选，默认 中心主题）"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path"],
-        ),
-        _tool(
-            "rename_sheet",
-            "重命名工作表。",
-            {
-                "file_path": file_path_prop,
-                "sheet_index": {"type": "integer", "description": "工作表索引"},
-                "title": {"type": "string", "description": "新标题"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "sheet_index", "title"],
-        ),
-        _tool(
-            "delete_sheet",
-            "删除工作表（至少保留一张）。",
-            {
-                "file_path": file_path_prop,
-                "sheet_index": {"type": "integer", "description": "要删除的工作表索引"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "sheet_index"],
-        ),
-        _tool(
-            "move_sheet",
-            "移动工作表顺序。",
-            {
-                "file_path": file_path_prop,
-                "sheet_index": {"type": "integer", "description": "当前索引"},
-                "new_index": {"type": "integer", "description": "目标索引"},
-                "auto_save": {"type": "boolean", "description": "是否自动保存（默认 false）"},
-            },
-            ["file_path", "sheet_index", "new_index"],
-        ),
-    ]
-
-    allowed = resolve_toolset(toolset)
-    if allowed is None:
-        return tools
-    return [tool for tool in tools if tool.name in allowed]
-
-
 # ---------- 工具处理 ----------
 
 class XMindTools:
-    """工具处理入口，管理文件缓存和 OCR。"""
+    """工具处理入口，管理文件缓存。"""
 
     def __init__(self, config: Config):
         self.config = config
         self.workspace = XMindWorkspace()
-        self.ocr = OCRManager(config)
-
-    def close(self) -> None:
-        """释放 OCR 模型等资源。"""
-        self.ocr.unload()
+        # 写工具串行执行：MCP 客户端可能并发调用，两个写操作同时改
+        # 同一份缓存会把彼此的修改写坏。读工具不加锁，保持响应速度。
+        self._write_lock = asyncio.Lock()
 
     def _guard_paths(self, arguments: dict) -> None:
         """所有以 _path 结尾的参数都受 allowed_roots 约束。"""
@@ -1259,7 +468,7 @@ class XMindTools:
         """调用工具并返回 (内容块, 是否错误)。错误信息同时让 MCP 标记 isError。
 
         内容块可以是 TextContent，也可以是 ImageContent —— 多模态客户端
-        才能看到节点原图，而不是只能读 OCR 转出来的文字。
+        才能看到节点原图。
         """
         handler = self._handlers.get(name)
         if handler is None:
@@ -1271,7 +480,11 @@ class XMindTools:
             return [_text_block(f"❌ {e}")], True
 
         try:
-            result = await handler(self, arguments)
+            if name in _READ_ONLY_TOOLS:
+                result = await handler(self, arguments)
+            else:
+                async with self._write_lock:
+                    result = await handler(self, arguments)
             return _content_blocks(result), False
         except FileChangedError as e:
             return [_text_block(f"❌ {e}")], True
@@ -1307,26 +520,6 @@ class XMindTools:
             lines.append(f"  • ID: {n.id}  | 标题: {title}  | 图片: {n.image_src[:60]}")
         return "\n".join(lines)
 
-    async def _read_image_ocr(self, args: dict) -> str:
-        xm, _ = self.workspace.get(args["file_path"])
-        node = xm.find_topic(args["node_id"])
-        if not node:
-            return f"找不到节点: {args['node_id']}"
-        if not node.image_src:
-            return f"节点 '{_clean_title(node.title)}' 没有图片。"
-
-        image_data = load_topic_image(node, xm)
-        if not image_data:
-            return f"图片加载失败: {node.image_src}"
-
-        try:
-            result = await asyncio.to_thread(self.ocr.recognize, image_data)
-        except Exception as e:
-            return f"❌ OCR 失败: {type(e).__name__}: {e}"
-        header = f"📷 节点「{_clean_title(node.title)}」的图片 OCR 结果（{result.elapsed:.2f}s）："
-        body = result.text if result.text else "（未识别到文字）"
-        return f"{header}\n{body}"
-
     async def _get_image(self, args: dict) -> list:
         """把节点图片作为图片内容返回，交给多模态模型直接看。"""
         xm, _ = self.workspace.get(args["file_path"])
@@ -1353,16 +546,7 @@ class XMindTools:
             f"{prepared.source_width}×{prepared.source_height} → "
             f"{prepared.width}×{prepared.height}，{prepared.size_kb}KB"
         )
-        blocks: list = [_text_block(caption), _image_block(prepared)]
-
-        if args.get("include_ocr"):
-            try:
-                result = await asyncio.to_thread(self.ocr.recognize, image_data)
-                text = _truncate(result.text or "（未识别到文字）", MAX_OCR_CHARS)
-                blocks.append(_text_block(f"↳ [OCR] {text}"))
-            except Exception as e:
-                blocks.append(_text_block(f"↳ [OCR] 失败: {type(e).__name__}: {e}"))
-        return blocks
+        return [_text_block(caption), _image_block(prepared)]
 
     async def _render_preview(
         self, xm: XMindFile, sheet_index: int, max_side: int
@@ -1456,45 +640,22 @@ class XMindTools:
             max_images = MAX_INLINE_IMAGES
 
         # 只处理会出现在输出里的图片节点，
-        # 避免 max_depth/max_nodes 截断后仍全量识别或内联
-        visible_ids = {n.id for n in _iter_visible_topics(xm, max_depth, max_nodes)}
-        image_nodes = [n for n in xm.find_topics_with_image() if n.id in visible_ids]
+        # 避免 max_depth/max_nodes 截断后仍读取和压缩图片
+        image_nodes: list[TopicNode] = []
+        if image_mode == "inline":
+            visible_ids = {n.id for n in _iter_visible_topics(xm, max_depth, max_nodes)}
+            image_nodes = [n for n in xm.find_topics_with_image() if n.id in visible_ids]
 
-        # OCR 只在显式要求时跑：多模态模型看原图比 OCR 文本准得多，
-        # 还省掉 CPU 上每张 0.5~2 秒的识别时间。
-        ocr_results: dict[str, str] = {}
-        if image_mode in ("ocr", "both"):
-            for node in image_nodes:
-                try:
-                    image_data = load_topic_image(node, xm)
-                    if image_data:
-                        result = await asyncio.to_thread(self.ocr.recognize, image_data)
-                        ocr_results[node.id] = _truncate(
-                            result.text or "（未识别到文字）",
-                            MAX_OCR_CHARS,
-                            "OCR 结果过长已截断，可用 read_image_ocr 查看完整内容",
-                        )
-                except Exception as e:
-                    ocr_results[node.id] = f"（OCR 失败: {type(e).__name__}: {e}）"
-
-        # 格式化输出
-        lines = []
-        state = {"nodes": 0, "truncated": False}
-        for i, sheet in enumerate(xm.sheets):
-            if i > 0:
-                lines.append("")
-            lines.append(f"📄 工作表: {sheet.title}")
-            self._format_node_with_ocr(
-                sheet.root, "", True, lines, ocr_results,
-                include_ids=include_ids, clean=clean,
-                include_style=include_style,
-                max_depth=max_depth, max_nodes=max_nodes, state=state,
-            )
-        if state["truncated"]:
-            lines.append("…（输出已按 max_nodes 截断）")
-
-        text = "\n".join(lines)
-        if image_mode not in ("inline", "both") or not image_nodes:
+        text = format_topic_tree(
+            xm,
+            include_ids=include_ids,
+            clean=clean,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+            include_metadata=True,
+            include_style=include_style,
+        )
+        if image_mode != "inline" or not image_nodes:
             return text
 
         # 图片附在文本之后：客户端按顺序渲染，模型能对照节点 ID 找到对应图
@@ -1524,69 +685,6 @@ class XMindTools:
                 + "\n可调大 max_images，或用 get_image 单张读取。"
             ))
         return blocks
-
-    @staticmethod
-    def _format_node_with_ocr(
-        node: TopicNode,
-        prefix: str,
-        is_last: bool,
-        lines: list[str],
-        ocr_map: dict[str, str],
-        include_ids: bool,
-        clean: bool,
-        include_style: bool,
-        max_depth: Optional[int],
-        max_nodes: Optional[int],
-        state: dict,
-    ) -> None:
-        if max_nodes is not None and state["nodes"] >= max_nodes:
-            state["truncated"] = True
-            return
-        state["nodes"] += 1
-        connector = "└─ " if is_last else "├─ "
-        line = _format_node_line(node, include_ids, show_images=True, clean=clean)
-        lines.append(f"{prefix}{connector}{line}")
-
-        child_prefix = prefix + ("   " if is_last else "│  ")
-
-        # 内联 OCR 结果
-        if node.id in ocr_map and not clean:
-            ocr_text = ocr_map[node.id]
-            lines.append(f"{child_prefix}   ↳ [OCR] {ocr_text}")
-
-        # 输出节点元数据
-        if not clean:
-            if node.notes:
-                notes = _format_multiline(node.notes, child_prefix + "     ")
-                lines.append(f"{child_prefix}   📝 备注: {notes}")
-            if node.labels:
-                lines.append(f"{child_prefix}   🏷️ 标签: {', '.join(node.labels)}")
-            if node.hyperlink:
-                lines.append(f"{child_prefix}   🔗 链接: {node.hyperlink}")
-            if node.xmind_class and node.xmind_class != "topic":
-                lines.append(f"{child_prefix}   📌 主题类型: {node.xmind_class}")
-            if include_style and node.style:
-                props = node.style.get("properties", {})
-                if props:
-                    style_text = ", ".join(f"{k}={v}" for k, v in props.items())
-                    lines.append(f"{child_prefix}   🎨 样式: {style_text}")
-
-        if max_depth is not None and node.level >= max_depth:
-            return
-        for j, child in enumerate(node.children):
-            XMindTools._format_node_with_ocr(
-                child,
-                child_prefix,
-                j == len(node.children) - 1,
-                lines,
-                ocr_map,
-                include_ids=include_ids,
-                clean=clean,
-                include_style=include_style,
-                max_depth=max_depth,
-                max_nodes=max_nodes,
-                state=state,
-            )
 
     async def _find_node(self, args: dict) -> str:
         xm, _ = self.workspace.get(args["file_path"])
@@ -1683,7 +781,7 @@ class XMindTools:
                 "你的修改仍在内存中：可以用 save_file(output_path='另一个路径.xmind') 另存，"
                 "或重新读取文件后再改。"
             )
-        if os.path.abspath(saved_path) != os.path.abspath(file_path):
+        if _cache_key(saved_path) != _cache_key(file_path):
             # 另存通常还要继续改原文件，缓存要留着；只有原文件在编辑期间
             # 被外部改过时，才丢掉这个已经冲突的缓存。
             current = file_digest(file_path)
@@ -1999,11 +1097,7 @@ class XMindTools:
             topics=topics,
         )
         xm = writer.xm
-        self.workspace._cache[os.path.abspath(file_path)] = (
-            os.path.getmtime(file_path),
-            xm,
-            writer,
-        )
+        self.workspace.put(file_path, xm, writer)
         node_count = len(xm.all_topics())
         return f"✅ 已创建文件: {file_path}\n根主题: {args['root_title']}\n节点总数: {node_count}"
 
@@ -2020,11 +1114,7 @@ class XMindTools:
         )
         xm = writer.xm
         eq_count = _inject_equations(xm, writer, topics, root_meta)
-        self.workspace._cache[os.path.abspath(file_path)] = (
-            os.path.getmtime(file_path),
-            xm,
-            writer,
-        )
+        self.workspace.put(file_path, xm, writer)
         node_count = len(xm.all_topics())
         eq_note = f"\n公式: {eq_count} 个（已渲染为图片）" if eq_count else ""
         return f"✅ 已从 Markdown 创建文件: {file_path}\n根主题: {root_title}\n节点总数: {node_count}{eq_note}"
@@ -2035,7 +1125,9 @@ class XMindTools:
 
         raw = Path(md_path).read_bytes()
         markdown = ""
-        for encoding in ("utf-8", "gb18030"):
+        # 先试 utf-8-sig：Windows 记事本保存的 Markdown 常带 BOM，
+        # 不去掉会让第一个 "# 标题" 识别失败。
+        for encoding in ("utf-8-sig", "utf-8", "gb18030"):
             try:
                 markdown = raw.decode(encoding)
                 break
@@ -2054,11 +1146,7 @@ class XMindTools:
         )
         xm = writer.xm
         eq_count = _inject_equations(xm, writer, topics, root_meta)
-        self.workspace._cache[os.path.abspath(output_path)] = (
-            os.path.getmtime(output_path),
-            xm,
-            writer,
-        )
+        self.workspace.put(output_path, xm, writer)
         node_count = len(xm.all_topics())
         eq_note = f"\n公式: {eq_count} 个（已渲染为图片）" if eq_count else ""
         return (
@@ -2161,7 +1249,7 @@ class XMindTools:
                 class_counts[n.xmind_class] = class_counts.get(n.xmind_class, 0) + 1
 
         lines = [
-            f"📊 文件统计",
+            "📊 文件统计",
             f"工作表: {len(xm.sheets)}",
             f"节点总数: {total}（含根主题）",
             f"最大深度: L{max_depth}",
@@ -2226,8 +1314,17 @@ class XMindTools:
 
     async def _restore_backup(self, args: dict) -> str:
         file_path = args["file_path"]
+        backup_path = args["backup_path"]
+        # 只允许恢复 list_backups 为该文件列出的备份，避免把任意文件
+        # 复制到目标路径（restore_backup 本质是文件覆盖操作）。
+        known = {_cache_key(item["path"]) for item in list_backups(file_path)}
+        if _cache_key(backup_path) not in known:
+            return (
+                "❌ backup_path 不是该文件的自动备份。"
+                "请先调用 list_backups 获取可用的备份路径。"
+            )
         try:
-            saved = restore_backup(file_path, args["backup_path"])
+            saved = restore_backup(file_path, backup_path)
         except (FileNotFoundError, PermissionError, OSError) as e:
             return f"❌ 恢复失败: {type(e).__name__}: {e}"
         self.workspace.invalidate(file_path)
@@ -2307,7 +1404,11 @@ class XMindTools:
         lines.append(_counter_text("分支线型", branch_lines))
 
         if args.get("include_node_styles"):
-            max_nodes = min(int(args.get("max_nodes", 50) or 50), 200)
+            try:
+                max_nodes = int(args.get("max_nodes", 50) or 50)
+            except (TypeError, ValueError):
+                max_nodes = 50
+            max_nodes = min(max(max_nodes, 1), 200)
             lines.append("")
             lines.append(f"节点有效样式（前 {min(max_nodes, len(nodes))} 个）：")
             for n in nodes[:max_nodes]:
@@ -2321,20 +1422,22 @@ class XMindTools:
 
     async def _list_attachments(self, args: dict) -> str:
         xm, _ = self.workspace.get(args["file_path"])
-        referenced = {
-            n.image_src[4:]
-            for n in xm.all_topics()
-            if n.image_src and n.image_src.startswith("xap:")
-        }
-        entries: list[str] = []
+        referenced = collect_xap_refs(xm.raw_content)
+        if not xm._zip_bytes:
+            return "❌ 文件内容为空，无法读取附件。"
         try:
             with zipfile.ZipFile(io.BytesIO(xm._zip_bytes)) as zf:
-                entries = [name for name in zf.namelist() if not name.endswith("/")]
+                entries = {name for name in zf.namelist() if not name.endswith("/")}
         except zipfile.BadZipFile:
             return "❌ 文件不是有效的 xmind 包。"
-        attachments = [name for name in entries if name.startswith(("attachments/", "resources/"))]
-        used = [name for name in attachments if name in referenced]
-        unused = [name for name in attachments if name not in referenced]
+        attachments = sorted(
+            name for name in entries if name.startswith(("attachments/", "resources/"))
+        )
+        referenced_entries = {
+            entry for src in referenced if (entry := resolve_xap_entry(src, entries))
+        }
+        used = [name for name in attachments if name in referenced_entries]
+        unused = [name for name in attachments if name not in referenced_entries]
         lines = [f"附件/资源共 {len(attachments)} 个："]
         lines.append(f"被引用 ({len(used)})：")
         lines.extend(f"  • {name}" for name in used[:50])
@@ -2440,11 +1543,15 @@ class XMindTools:
 
     async def _list_sheets(self, args: dict) -> str:
         xm, _ = self.workspace.get(args["file_path"])
+        counts: dict[int, int] = {}
+        for node in xm.all_topics():
+            counts[node.sheet_index] = counts.get(node.sheet_index, 0) + 1
         lines = [f"共 {len(xm.sheets)} 张工作表："]
         for i, sheet in enumerate(xm.sheets):
-            node_count = sum(1 for n in xm.all_topics() if n.sheet_index == i)
             root_title = _clean_title(sheet.root.title) or "（无标题）"
-            lines.append(f"  {i}. {sheet.title}（根主题: {root_title}，节点: {node_count}）")
+            lines.append(
+                f"  {i}. {sheet.title}（根主题: {root_title}，节点: {counts.get(i, 0)}）"
+            )
         return "\n".join(lines)
 
     async def _add_sheet(self, args: dict) -> str:
@@ -2481,31 +1588,11 @@ class XMindTools:
         msg = f"✅ 工作表已从 {args['sheet_index']} 移动到 {args['new_index']}。"
         return self._auto_save_msg(file_path, writer, args, msg)
 
-    async def _get_hardware_info(self, args: dict) -> str:
-        c = self.config
-        ok, msg = verify_installed(c.ocr_engine, c.device)
-        lines = [
-            f"🖥️ 操作系统: {c.os}",
-            f"🔧 OCR 引擎: {c.ocr_engine}",
-            f"⚡ 推理设备: {c.device}",
-            f"✅ 设备状态: {'可用 - ' + msg if ok else '不可用 - ' + msg}",
-            f"💾 内存: {c.ram_gb} GB",
-            f"🧠 CPU 核心数: {c.cpu_count}",
-        ]
-        if c.gpus:
-            for g in c.gpus:
-                vram = f", 显存: {g['vram_mb']}MB" if g.get("vram_mb") else ""
-                lines.append(f"🎮 显卡: {g['name']} ({g['vendor']}{vram})")
-        else:
-            lines.append("🎮 显卡: 未检测到")
-        return "\n".join(lines)
-
     # ---- handler 注册表 ----
     _handlers = {
         "read_structure": _read_structure,
         "read_all": _read_all,
         "list_images": _list_images,
-        "read_image_ocr": _read_image_ocr,
         "get_image": _get_image,
         "get_preview": _get_preview,
         "find_node": _find_node,
@@ -2541,7 +1628,6 @@ class XMindTools:
         "repair_file": _repair_file,
         "apply_to_matching": _apply_to_matching,
         "analyze_file": _analyze_file,
-        "get_hardware_info": _get_hardware_info,
         "list_backups": _list_backups,
         "restore_backup": _restore_backup,
         "export_svg": _export_svg,
@@ -2572,355 +1658,6 @@ def _export_node_md(node: TopicNode, depth: int, lines: list[str], include_ids: 
         _export_node_md(child, depth + 1, lines, include_ids)
 
 
-def _strip_inline_markup(text: str) -> tuple[str, bool, bool]:
-    """去掉行内的加粗/斜体标记，返回 (干净文本, 是否加粗, 是否斜体)。
-
-    支持 **粗体** / __粗体__ / *斜体* / ***粗斜体***；
-    代码块内容不会走到这里（由调用方用 kind="fence" 跳过）。
-    """
-    bold = False
-    italic = False
-
-    def _bold_italic(m: re.Match) -> str:
-        nonlocal bold, italic
-        bold = True
-        italic = True
-        return m.group(1)
-
-    def _bold(m: re.Match) -> str:
-        nonlocal bold
-        bold = True
-        return m.group(1)
-
-    def _italic(m: re.Match) -> str:
-        nonlocal italic
-        italic = True
-        return m.group(1)
-
-    text = re.sub(r"\*\*\*(.+?)\*\*\*", _bold_italic, text, flags=re.S)
-    text = re.sub(r"\*\*(.+?)\*\*", _bold, text, flags=re.S)
-    text = re.sub(r"__(.+?)__", _bold, text, flags=re.S)
-    text = re.sub(r"\*([^*]+?)\*", _italic, text, flags=re.S)
-    return text.strip(), bold, italic
-
-
-def _split_table_row(line: str) -> list[str]:
-    """拆分表格行，忽略最外层管道符，去掉单元格首尾空格。"""
-    line = line.strip()
-    if line.startswith("|"):
-        line = line[1:]
-    if line.endswith("|") and not line.endswith("\\|"):
-        line = line[:-1]
-    return [cell.strip() for cell in line.split("|")]
-
-
-def _is_table_separator(line: str) -> bool:
-    """判断是否为 markdown 表格分隔行（如 |---|---|）。"""
-    if "|" not in line:
-        return False
-    cells = _split_table_row(line)
-    return bool(cells) and all(
-        re.fullmatch(r":?-{1,}:?", cell.replace(" ", ""))
-        for cell in cells
-    )
-
-
-def _parse_table_block(lines: list[str]) -> dict:
-    """把连续表格行解析成 XMind 风格的行节点 + 单元格子节点。
-
-    与 XMind 软件导入保持一致：
-    - 行节点标题 = 第一列内容；
-    - 子节点 = 其余列内容，labels = 对应列的表头（帮助模型/用户识别列含义）。
-    返回 {"header": 表头单元格列表, "rows": 行节点列表}。
-    """
-    header = _split_table_row(lines[0])
-    rows: list[dict] = []
-    for line in lines[2:]:
-        cells = _split_table_row(line)
-        if not cells:
-            continue
-        row: dict = {"title": cells[0], "children": []}
-        for col in range(1, len(cells)):
-            child: dict = {"title": cells[col], "children": []}
-            if col < len(header) and header[col]:
-                child["labels"] = [header[col]]
-            row["children"].append(child)
-        rows.append(row)
-    return {"header": header, "rows": rows}
-
-
-def _apply_table_meta(parent: dict, header: list[str]) -> None:
-    """把父节点标记成 XMind 原生电子表格结构。
-
-    只有 structureClass + 列定义扩展，XMind 才会把这一支渲染成真正的
-    表格（spreadsheet），否则只是普通的“一堆分支”。
-    """
-    if not header:
-        return
-    parent["structureClass"] = "org.xmind.ui.spreadsheet"
-    columns = [{"name": "leading-column", "content": header[0]}] + [
-        {"name": "column", "content": cell}
-        for cell in header[1:]
-        if cell
-    ]
-    parent["extensions"] = [{
-        "provider": "org.xmind.ui.spreadsheet",
-        "content": [{"name": "columns", "content": columns}],
-    }]
-
-
-def _parse_markdown_outline(markdown: str) -> tuple[str, list[dict], dict]:
-    """把 Markdown 解析成 create_file 用的嵌套结构。
-
-    处理规则（对齐 XMind 软件导入行为）：
-    - 标题/列表：按层级挂树，行首的 **加粗** 不再被误当成列表符号吞掉；
-    - 行内 **加粗** / *斜体*：去掉标记，并把样式写进节点（fo:font-weight/italic）；
-    - 表格（表头 + 分隔行 + 数据行）：行节点 + 单元格子节点，单元格带上列名标签；
-    - 引用块（> 开头）：变成“前一个节点”的备注；
-    - 代码块内容原样保留，不做行内解析；
-    - 纯分隔线（--- / *** / ___）不产生节点。
-    """
-    items: list[dict] = []
-    in_fence = False
-    current_heading = 0
-    lines = markdown.splitlines()
-    i = 0
-    while i < len(lines):
-        raw_line = lines[i]
-        stripped_line = raw_line.strip()
-        if stripped_line.startswith("```"):
-            in_fence = not in_fence
-            i += 1
-            continue
-        if not stripped_line:
-            i += 1
-            continue
-        # 纯分隔线不是内容，跳过
-        if not in_fence and re.fullmatch(r"[-*_]{3,}", stripped_line):
-            i += 1
-            continue
-
-        indent = len(raw_line) - len(raw_line.lstrip())
-        if in_fence:
-            # 代码块内容：原样保留，不做行内解析
-            base = current_heading + 1 if current_heading else 0
-            items.append({"level": base + indent // 2, "text": stripped_line, "kind": "fence"})
-            i += 1
-            continue
-        if stripped_line.startswith("#"):
-            heading = stripped_line.lstrip("#")
-            level = len(stripped_line) - len(heading)
-            current_heading = level
-            items.append({"level": level, "text": heading.strip(), "kind": "text"})
-            i += 1
-            continue
-        # 表格：当前行像表头，且下一行是分隔行
-        if (
-            "|" in stripped_line
-            and i + 1 < len(lines)
-            and _is_table_separator(lines[i + 1].strip())
-        ):
-            block = [stripped_line]
-            # 从分隔行开始收集（分隔行也是表格的一部分，_parse_table_block 需要它）
-            j = i + 1
-            while j < len(lines):
-                next_line = lines[j].strip()
-                if "|" in next_line:
-                    block.append(next_line)
-                    j += 1
-                else:
-                    break
-            base = current_heading + 1 if current_heading else 0
-            parsed = _parse_table_block(block)
-            for row_index, row in enumerate(parsed["rows"]):
-                item: dict = {"level": base + indent // 2, "kind": "topic", "topic": row}
-                if row_index == 0:
-                    item["table_meta"] = parsed["header"]
-                items.append(item)
-            i = j
-            continue
-        if stripped_line.startswith(">"):
-            # 引用块 → 前一个节点的备注
-            note_text, _, _ = _strip_inline_markup(stripped_line.lstrip(">").strip())
-            items.append({"kind": "note", "text": note_text})
-            i += 1
-            continue
-        if stripped_line.startswith("$$"):
-            # 块级公式：$$...$$（可跨多行），随后渲染成图片插入节点
-            seg = stripped_line[2:].strip()
-            if "$$" in seg:
-                latex = seg.split("$$", 1)[0].strip()
-                i += 1
-            else:
-                latex = seg
-                i += 1
-                while i < len(lines):
-                    nxt = lines[i].strip()
-                    if "$$" in nxt:
-                        rest = nxt.split("$$", 1)[0].strip()
-                        if rest:
-                            latex += "\n" + rest
-                        i += 1
-                        break
-                    latex += "\n" + nxt
-                    i += 1
-            base = current_heading + 1 if current_heading else 0
-            items.append({"level": base + indent // 2, "kind": "equation", "latex": latex.strip()})
-            continue
-        # 列表/普通文本：只认“符号 + 空格”的列表标记，
-        # 避免把行首 **加粗** 当成 * 列表符号吃掉
-        text = re.sub(r"^(?:[-+>]\s+|[-*+]\s+)+", "", stripped_line).strip()
-        base = current_heading + 1 if current_heading else 0
-        items.append({"level": base + indent // 2, "text": text, "kind": "text"})
-        i += 1
-
-    if not items:
-        raise ValueError("Markdown 内容为空，无法创建文件")
-
-    # 整体归一化：最小层级变成 1
-    min_level = min(item["level"] for item in items if item.get("level") is not None)
-
-    # 先挂到虚拟根上：标准大纲算法，层级跳变时自动成为上层节点的子节点
-    virtual: dict = {"title": "", "children": []}
-    stack: list[tuple[int, dict]] = [(0, virtual)]
-    last_topic: Optional[dict] = None
-    for item in items:
-        if item["kind"] == "note":
-            if last_topic is not None:
-                existing = last_topic.get("notes") or ""
-                last_topic["notes"] = (existing + "\n" if existing else "") + item["text"]
-                # 引用块转成的备注要直接显示在画布上（XMind 的 notesDisplay: block）
-                last_topic["notesDisplay"] = "block"
-            else:
-                # 没有前置节点时兜底成普通节点
-                note_node: dict = {"title": item["text"], "children": []}
-                virtual["children"].append(note_node)
-                last_topic = note_node
-            continue
-
-        level = max(item["level"] - min_level + 1, 1)
-        while len(stack) > 1 and level <= stack[-1][0]:
-            stack.pop()
-        parent = stack[-1][1]
-        if item["kind"] == "topic":
-            child = item["topic"]
-            table_header = item.get("table_meta")
-            if table_header:
-                _apply_table_meta(parent, table_header)
-        elif item["kind"] == "equation":
-            # 公式节点：标题暂存 LaTeX，_formula 标记用于导入后渲染成图片
-            child = {"title": item["latex"], "_formula": item["latex"], "children": []}
-        else:
-            text, bold, italic = _strip_inline_markup(item["text"])
-            child = {"title": text, "children": []}
-            if bold or italic:
-                props: dict[str, str] = {}
-                if bold:
-                    props["fo:font-weight"] = "bold"
-                if italic:
-                    props["fo:font-style"] = "italic"
-                child["style"] = {"properties": props}
-        parent["children"].append(child)
-        stack.append((level, child))
-        last_topic = child
-
-    top_level = virtual["children"]
-    if len(top_level) == 1:
-        # 只有一个顶层条目（典型：# 根主题 + 各层子节点），它就是中心主题
-        real_root = top_level[0]
-        root_meta = {
-            key: real_root[key]
-            for key in ("structureClass", "extensions", "notesDisplay", "style")
-            if real_root.get(key)
-        }
-        # 中心主题本身是一个公式节点（如 md 只有一行 $$...$$ 时）也要能渲染
-        if real_root.get("_formula"):
-            root_meta["_formula"] = real_root["_formula"]
-        return real_root["title"], real_root["children"], root_meta
-    # 多个顶层条目（平铺列表 / 多个 # 标题）→ 自动加“未命名”中心主题，
-    # 所有顶层条目保持兄弟关系，不被错误嵌套
-    return "未命名", top_level, {}
-
-
-def _render_formula_to_temp(latex: str) -> Optional[str]:
-    """把 LaTeX 公式渲染成临时 PNG，返回路径；失败返回 None。"""
-    fd, path = tempfile.mkstemp(suffix=".png")
-    os.close(fd)
-    if render_latex_png(latex, path):
-        return path
-    try:
-        os.remove(path)
-    except OSError:
-        pass
-    return None
-
-
-def _inject_equations(xm: XMindFile, writer: XMindWriter, topics: list[dict], root_meta: dict) -> int:
-    """把 topics/root 结构里标记了 _formula 的节点渲染成图片并插入生成的 xmind。
-
-    公式节点在 XMindWriter.create 时被 _build_topic 创建（_formula 标记被忽略），
-    标题暂存为 LaTeX 文本。这里按路径定位到对应节点，渲染图片后插入，
-    并清空标题（图片即内容）。渲染失败时保留 LaTeX 文本，不影响导入。
-
-    返回成功插入的公式数量。
-    """
-    eqs: list[tuple[list[int], str]] = []
-    # 中心主题本身是公式（如 md 只有一行 $$...$$）
-    if root_meta.get("_formula"):
-        eqs.append(([], root_meta["_formula"]))
-
-    def walk(node_list: list[dict], path: list[int]) -> None:
-        for idx, child in enumerate(node_list):
-            latex = child.get("_formula")
-            if latex:
-                eqs.append((path + [idx], latex))
-            walk(child.get("children") or [], path + [idx])
-
-    walk(topics, [])
-    if not eqs:
-        return 0
-
-    root = (xm.raw_content[0] or {}).get("rootTopic") or {}
-    inserted = 0
-    for path, latex in eqs:
-        topic: Any = root
-        ok_nav = True
-        for idx in path:
-            kids = (topic.get("children") or {}).get("attached") or []
-            if idx < len(kids):
-                topic = kids[idx]
-            else:
-                ok_nav = False
-                break
-        if not ok_nav or not topic.get("id"):
-            continue
-        png = _render_formula_to_temp(latex)
-        if not png:
-            continue
-        try:
-            ok, _ = writer.add_image(topic["id"], png)
-        finally:
-            try:
-                os.remove(png)
-            except OSError:
-                pass
-        if ok:
-            topic["title"] = ""  # 图片即内容，清空暂存的 LaTeX 标题
-            inserted += 1
-    if inserted:
-        xm.refresh_from_raw()
-        # add_image 只更新内存和 _extra_files，必须 save 才把图片写进磁盘 zip
-        try:
-            writer.save()
-        except Exception as exc:  # 保存失败不影响导入结果，但磁盘上无图片
-            print(
-                f"[xmind-mcp] 公式图片保存失败: {type(exc).__name__}: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
-    return inserted
-
-
 def _build_svg(xm: XMindFile) -> tuple[str, dict]:
     """把节点树画成一张示意图 SVG（给人工预览用，不是 XMind 的像素级渲染）。
 
@@ -2929,7 +1666,6 @@ def _build_svg(xm: XMindFile) -> tuple[str, dict]:
     MARGIN = 40
     BOX_H = 34
     GAP = 12
-    LEVEL_W = 240
 
     def _esc(text: str) -> str:
         return (
@@ -2940,10 +1676,18 @@ def _build_svg(xm: XMindFile) -> tuple[str, dict]:
             .replace('"', "&quot;")
         )
 
+    height_cache: dict[int, int] = {}
+
     def _height(node: TopicNode) -> int:
+        """叶子数（即竖直占位）；缓存避免大图重复递归。"""
+        key = id(node)
+        if key in height_cache:
+            return height_cache[key]
         if not node.children:
-            return 1
-        return sum(_height(child) for child in node.children)
+            height_cache[key] = 1
+        else:
+            height_cache[key] = sum(_height(child) for child in node.children)
+        return height_cache[key]
 
     def _box_width(title: str) -> int:
         return min(320, max(110, 28 + len(title) * 15))

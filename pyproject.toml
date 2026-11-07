@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xmind-mcp-server"
-version = "0.4.0"
-description = "让大模型读写 XMind 文件，支持图片直传与本地 OCR 的 MCP Server"
+version = "0.5.0"
+description = "让大模型读写 XMind 文件：图片直接交给多模态模型，无 OCR 依赖"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -25,29 +25,23 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=2.0.0",
-    "psutil>=5.9.0",
     "Pillow>=10.0.0",
-    # OCR 依赖设为必装，保证 pip install 后开箱即用（首次启动只需下载模型）
-    "rapidocr-onnxruntime>=1.2.0",
-    "onnxruntime>=1.16.0",
-    # 用 mathtext 把 Markdown 里的 LaTeX 公式渲染成图片，插入对应节点
+    # 用 mathtext 把 Markdown 里的 LaTeX 公式渲染成图片，并绘制预览图
     "matplotlib>=3.5.0",
 ]
 
 [project.optional-dependencies]
-paddleocr = [
-    "paddleocr>=2.7.0",
-    "paddlepaddle>=2.6.0",
-]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "ruff>=0.8.0",
 ]
+# 旧版用户可能还在用 pip install "xmind-mcp-server[all]"；
+# OCR 已移除，这里只保留开发依赖，避免安装直接失败。
 all = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
-    "paddleocr>=2.7.0",
-    "paddlepaddle>=2.6.0",
+    "ruff>=0.8.0",
 ]
 
 [project.scripts]
@@ -68,3 +62,12 @@ xmind_mcp = ["default_theme.json"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+# E4/E7/E9 + F 是 ruff 默认规则；B（bugbear）抓常见逻辑坑
+select = ["E4", "E7", "E9", "F", "B"]

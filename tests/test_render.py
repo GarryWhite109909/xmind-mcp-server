@@ -124,7 +124,7 @@ async def test_get_preview_renders_requested_sheet(tmp_path: Path):
         _sheet("第一张", _tree(["甲", "乙"]), "sheet-1"),
         _sheet("第二张", _tree(["丙", "丁"]), "sheet-2"),
     ])
-    tools = XMindTools(Config(ocr_engine="rapidocr", device="cpu", initialized=True))
+    tools = XMindTools(Config())
 
     blocks = await tools.call_tool(
         "get_preview", {"file_path": str(path), "source": "render", "sheet": 1}
@@ -140,7 +140,7 @@ async def test_get_preview_out_of_range_sheet(tmp_path: Path, sheet: int):
     from xmind_mcp.tools import XMindTools
 
     path = _make_xmind(tmp_path / "one.xmind", [_sheet("唯一", _tree(["甲"]))])
-    tools = XMindTools(Config(ocr_engine="rapidocr", device="cpu", initialized=True))
+    tools = XMindTools(Config())
 
     blocks = await tools.call_tool(
         "get_preview", {"file_path": str(path), "source": "render", "sheet": sheet}

@@ -1,5 +1,6 @@
 """测试 MCP 工具层。"""
 
+import asyncio
 import base64
 import json
 import zipfile
@@ -8,17 +9,14 @@ from pathlib import Path
 import pytest
 
 from xmind_mcp.config import Config
+from xmind_mcp.tool_schemas import TOOLSETS, build_tool_list
+from xmind_mcp.tools import XMindTools
 from xmind_mcp.xmind_parser import parse_xmind
-from xmind_mcp.tools import TOOLSETS, XMindTools, build_tool_list, format_topic_tree
 
 
 @pytest.fixture
 def config() -> Config:
-    return Config(
-        ocr_engine="rapidocr",
-        device="cpu",
-        initialized=True,
-    )
+    return Config()
 
 
 @pytest.fixture
@@ -94,13 +92,13 @@ async def test_list_images(config: Config, xmind_with_image: Path):
     assert "img-node" in result[0].text
 
 
-async def test_read_image_ocr(config: Config, xmind_with_image: Path):
+async def test_list_attachments_recognizes_xap_images(config: Config, xmind_with_image: Path):
+    """xap:images/test.png 对应 attachments/images/test.png，应标为已引用。"""
     tools = XMindTools(config)
-    result = await tools.call_tool("read_image_ocr", {
-        "file_path": str(xmind_with_image),
-        "node_id": "img-node",
-    })
-    assert "OCR" in result[0].text
+    result = await tools.call_tool("list_attachments", {"file_path": str(xmind_with_image)})
+    text = result[0].text
+    assert "attachments/images/test.png" in text
+    assert "未被引用 (0)" in text
 
 
 async def test_find_node(config: Config, sample_xmind: Path):
@@ -177,12 +175,6 @@ async def test_file_not_found(config: Config):
     tools = XMindTools(config)
     result = await tools.call_tool("read_structure", {"file_path": "不存在的文件.xmind"})
     assert "文件不存在" in result[0].text
-
-
-async def test_get_hardware_info(config: Config):
-    tools = XMindTools(config)
-    result = await tools.call_tool("get_hardware_info", {})
-    assert "OCR 引擎" in result[0].text
 
 
 async def test_save_as_then_save_original(config: Config, sample_xmind: Path, tmp_path: Path):
@@ -350,6 +342,22 @@ async def test_import_markdown_file_tool(config: Config, tmp_path: Path):
     assert "int x = 1;" in titles
 
 
+async def test_import_markdown_file_handles_bom(config: Config, tmp_path: Path):
+    """带 UTF-8 BOM 的 Markdown 也要能识别第一个标题。"""
+    tools = XMindTools(config)
+    md_path = tmp_path / "bom.md"
+    md_path.write_text("# BOM 标题\n- 子项\n", encoding="utf-8-sig")
+    out_path = tmp_path / "bom.xmind"
+
+    result = await tools.call_tool("import_markdown_file", {
+        "file_path": str(md_path),
+        "output_path": str(out_path),
+    })
+    assert "已原样转换 Markdown" in result[0].text
+    xm = parse_xmind(out_path)
+    assert xm.sheets[0].root.title == "BOM 标题"
+
+
 async def test_import_markdown_renders_block_equations(config: Config, tmp_path: Path):
     """块级 $$...$$ 公式应被渲染成图片插入节点，行内 $...$ 保持文本。"""
     tools = XMindTools(config)
@@ -464,7 +472,7 @@ async def test_apply_to_matching_tool(config: Config, sample_xmind: Path):
     })
     assert "2 个节点" in result[0].text
 
-    detail = await tools.call_tool("get_node", {
+    await tools.call_tool("get_node", {
         "file_path": str(sample_xmind),
         "node_id": "root-1",
     })
@@ -678,6 +686,19 @@ def test_tool_annotations_mark_read_only_and_destructive():
     assert tools["set_node_style"].annotations.open_world_hint is False
 
 
+def test_every_listed_tool_has_handler():
+    """工具列表和 handler 注册表必须一一对应，避免改名后调用落空。"""
+    listed = {t.name for t in build_tool_list()}
+    assert listed == set(XMindTools._handlers)
+
+
+def test_read_only_flags_match_read_tools():
+    """read 组里的工具必须都标记为只读，只读集合里也不能有列表外的工具。"""
+    read_tools = build_tool_list("read")
+    assert all(t.annotations.read_only_hint for t in read_tools)
+    assert {t.name for t in read_tools} <= {t.name for t in build_tool_list()}
+
+
 def test_toolsets_cover_every_tool_exactly_once():
     """分组必须覆盖全部工具，且一个工具只属于一组。"""
     all_names = {t.name for t in build_tool_list()}
@@ -695,16 +716,81 @@ def test_build_tool_list_filters_by_toolset():
     assert len(combined) == len(TOOLSETS["read"]) + len(TOOLSETS["export"])
 
     # 写错组名时给全量工具，而不是一个都没有
-    assert len(build_tool_list("不存在的组")) == 57
-    assert len(build_tool_list("all")) == 57
+    assert len(build_tool_list("不存在的组")) == 55
+    assert len(build_tool_list("all")) == 55
+
+
+def test_legacy_config_fields_are_ignored(tmp_path: Path, monkeypatch):
+    """旧版配置里的 ocr_engine/device 不应阻止加载，ocr 模式归一化为 inline。"""
+    from xmind_mcp import config as config_module
+
+    config_file = tmp_path / "config.json"
+    config_file.write_text(
+        json.dumps({
+            "ocr_engine": "rapidocr",
+            "device": "cuda",
+            "initialized": True,
+            "image_mode": "ocr",
+            "toolset": "read",
+            "image_max_side": "not-a-number",
+            "allowed_roots": "D:\\docs",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "CONFIG_FILE", config_file)
+
+    config = Config.load()
+    assert config.image_mode == "inline"
+    assert config.toolset == "read"
+    assert config.image_max_side == 1024
+    assert config.allowed_roots == ["D:\\docs"]
+    assert not hasattr(config, "ocr_engine")
+
+
+async def test_concurrent_writes_are_serialized(config: Config, sample_xmind: Path):
+    """并发写同一个文件时串行执行，两个修改都不能丢。"""
+    tools = XMindTools(config)
+    await asyncio.gather(
+        tools.call_tool("add_node", {
+            "file_path": str(sample_xmind), "parent_id": "root-1", "title": "并发A",
+        }),
+        tools.call_tool("add_node", {
+            "file_path": str(sample_xmind), "parent_id": "root-1", "title": "并发B",
+        }),
+    )
+    result = await tools.call_tool("read_structure", {"file_path": str(sample_xmind)})
+    assert "并发A" in result[0].text
+    assert "并发B" in result[0].text
+
+
+async def test_restore_backup_only_accepts_listed_backups(
+    config: Config, sample_xmind: Path, tmp_path: Path
+):
+    from xmind_mcp.xmind_writer import list_backups
+
+    tools = XMindTools(config)
+    await tools.call_tool("save_file", {"file_path": str(sample_xmind)})
+    backups = list_backups(str(sample_xmind))
+    assert backups
+
+    ok = await tools.call_tool(
+        "restore_backup",
+        {"file_path": str(sample_xmind), "backup_path": backups[0]["path"]},
+    )
+    assert "已从备份恢复" in ok[0].text
+
+    evil = tmp_path / "evil.xmind"
+    evil.write_bytes(b"not a backup")
+    blocks, _err = await tools.call_tool_status(
+        "restore_backup",
+        {"file_path": str(sample_xmind), "backup_path": str(evil)},
+    )
+    assert "不是该文件的自动备份" in blocks[0].text
 
 
 async def test_allowed_roots_blocks_outside_paths(tmp_path: Path, sample_xmind: Path):
     """配置了 allowed_roots 后，目录内的文件可用，目录外直接拒绝。"""
-    config = Config(
-        ocr_engine="rapidocr", device="cpu", initialized=True,
-        allowed_roots=[str(sample_xmind.parent)],
-    )
+    config = Config(allowed_roots=[str(sample_xmind.parent)])
     tools = XMindTools(config)
 
     _, err = await tools.call_tool_status(
@@ -722,7 +808,7 @@ async def test_allowed_roots_blocks_outside_paths(tmp_path: Path, sample_xmind: 
 
 async def test_allowed_roots_empty_means_unrestricted(sample_xmind: Path):
     """默认不配置 allowed_roots 时保持旧行为。"""
-    tools = XMindTools(Config(ocr_engine="rapidocr", device="cpu", initialized=True))
+    tools = XMindTools(Config())
     _, err = await tools.call_tool_status(
         "read_structure", {"file_path": str(sample_xmind)}
     )

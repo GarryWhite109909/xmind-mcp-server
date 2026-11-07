@@ -7,16 +7,16 @@ from pathlib import Path
 
 import pytest
 
+from xmind_mcp.markdown_import import _parse_markdown_outline
 from xmind_mcp.config import Config
-from xmind_mcp.ocr.base import OcrResult
-from xmind_mcp.tools import XMindTools, _effective_style, _parse_markdown_outline
+from xmind_mcp.tools import XMindTools, _effective_style
 from xmind_mcp.xmind_parser import parse_xmind
 from xmind_mcp.xmind_writer import XMindWriter, list_backups
 
 
 @pytest.fixture
 def config() -> Config:
-    return Config(ocr_engine="rapidocr", device="cpu", initialized=True)
+    return Config()
 
 
 PNG_B64 = (
@@ -302,31 +302,34 @@ def test_apply_matching_atomic_on_invalid_style(tmp_path: Path):
         assert "style" not in raw or "fo:color" not in raw.get("style", {}).get("properties", {})
 
 
-async def test_read_all_ocr_respects_max_depth(config: Config, tmp_path: Path):
-    """read_all 的 max_depth 之外的图片不应触发 OCR。"""
+def test_markdown_only_quote_does_not_crash():
+    """只有引用块、没有任何标题/列表时也要能生成导图，而不是 min() 报错。"""
+    root, topics, _meta = _parse_markdown_outline("> 只有一行引用")
+    assert root == "只有一行引用"
+    assert topics == []
+
+
+async def test_read_all_respects_max_depth_for_images(config: Config, tmp_path: Path):
+    """max_depth 之外的图片不应被读取和内联。"""
     content = [{"id": "s", "title": "S", "rootTopic": {"id": "root", "title": "R", "children": {"attached": [
         {"id": "img1", "title": "一层图", "image": {"src": "xap:images/a.png"}},
         {"id": "n", "title": "分支", "children": {"attached": [
             {"id": "img2", "title": "二层图", "image": {"src": "xap:images/b.png"}},
         ]}},
     ]}}}]
-    p = tmp_path / "ocr.xmind"
+    p = tmp_path / "depth.xmind"
     _make_xmind(p, content, {"attachments/images/a.png": base64.b64decode(PNG_B64),
                              "attachments/images/b.png": base64.b64decode(PNG_B64)})
 
     tools = XMindTools(config)
-    calls = []
-
-    def fake_recognize(image):
-        calls.append(image)
-        return OcrResult(text="TEXT", lines=[])
-
-    tools.ocr.recognize = fake_recognize
     result = await tools.call_tool(
-        "read_all", {"file_path": str(p), "max_depth": 1, "image_mode": "ocr"}
+        "read_all", {"file_path": str(p), "max_depth": 1}
     )
-    assert len(calls) == 1
-    assert "TEXT" in result[0].text
+    images = [b for b in result if getattr(b, "type", "") == "image"]
+    captions = "\n".join(b.text for b in result if getattr(b, "type", "") == "text")
+    assert len(images) == 1
+    assert "img1" in captions
+    assert "img2" not in captions
 
 
 async def test_read_all_truncates_long_notes(config: Config, tmp_path: Path):
@@ -373,6 +376,29 @@ def test_create_file_backs_up_existing(tmp_path: Path, monkeypatch: pytest.Monke
     with zipfile.ZipFile(backups[0]) as zf:
         content = json.loads(zf.read("content.json"))
         assert content[0]["rootTopic"]["title"] == "第一次"
+
+
+def test_backups_are_namespaced_by_full_path(tmp_path: Path, monkeypatch):
+    """不同目录下的同名 xmind 不能共用备份池。"""
+    import xmind_mcp.xmind_writer as xw
+
+    backup_dir = tmp_path / "backups"
+    monkeypatch.setattr(xw, "BACKUP_DIR", backup_dir)
+
+    content = [{"id": "s", "title": "S", "rootTopic": {"id": "root", "title": "R"}}]
+    a = tmp_path / "a" / "note.xmind"
+    b = tmp_path / "b" / "note.xmind"
+    a.parent.mkdir()
+    b.parent.mkdir()
+    _make_xmind(a, content)
+    _make_xmind(b, content)
+
+    xw.XMindWriter(parse_xmind(a)).save()
+    xw.XMindWriter(parse_xmind(b)).save()
+
+    assert len(list_backups(str(a))) == 1
+    assert len(list_backups(str(b))) == 1
+    assert list_backups(str(a))[0]["path"] != list_backups(str(b))[0]["path"]
 
 
 def test_list_and_restore_backup(tmp_path: Path):

@@ -3,7 +3,6 @@
 import json
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -17,7 +16,7 @@ def server_process():
         "import asyncio;"
         "from xmind_mcp.config import Config;"
         "from xmind_mcp.server import run_server;"
-        "asyncio.run(run_server(Config(ocr_engine='rapidocr', device='cpu', initialized=True)))"
+        "asyncio.run(run_server(Config()))"
     )
     proc = subprocess.Popen(
         [sys.executable, "-c", code],
@@ -78,7 +77,7 @@ def test_server_initialize_and_list_tools(server_process: subprocess.Popen):
     list_resp = _recv(server_process)
     assert list_resp["id"] == 2
     tools = list_resp["result"]["tools"]
-    assert len(tools) == 57
+    assert len(tools) == 55
     assert any(t["name"] == "read_structure" for t in tools)
     assert any(t["name"] == "find_node" for t in tools)
     assert any(t["name"] == "export_markdown" for t in tools)

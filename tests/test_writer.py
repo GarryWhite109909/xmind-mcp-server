@@ -160,6 +160,64 @@ def test_duplicate_node(sample_xmind: Path):
     assert xm.find_topic("child-2") is not None
 
 
+def test_duplicate_node_remaps_summary_reference(tmp_path: Path):
+    """复制带概要的子树后，summaries[].topicId 必须指向复制出来的概要节点。"""
+    import zipfile
+
+    path = tmp_path / "summary.xmind"
+    content = [{
+        "id": "s", "title": "S",
+        "rootTopic": {"id": "root", "title": "R", "children": {"attached": [
+            {
+                "id": "a", "title": "A",
+                "children": {
+                    "attached": [{"id": "a1", "title": "A1"}, {"id": "a2", "title": "A2"}],
+                    "summary": [{"id": "sum-topic", "title": "概要"}],
+                },
+                "summaries": [{"id": "sum", "range": "(0,1)", "topicId": "sum-topic"}],
+            },
+        ]}},
+    }]
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("content.json", json.dumps(content, ensure_ascii=False))
+
+    writer = XMindWriter(parse_xmind(path))
+    copied = writer.duplicate_node("a", "root")
+    assert copied is not None
+
+    raw = copied._raw
+    summary_topic_ids = {
+        child["id"] for child in raw["children"].get("summary", [])
+    }
+    assert raw["summaries"][0]["topicId"] in summary_topic_ids
+    assert raw["summaries"][0]["topicId"] != "sum-topic"
+
+
+def test_merge_duplicate_nodes_drops_orphan_summary(tmp_path: Path):
+    """合并重复节点时，不能把被删节点的概要主题变成没有 range 的孤儿。"""
+    import zipfile
+
+    path = tmp_path / "merge.xmind"
+    content = [{
+        "id": "s", "title": "S",
+        "rootTopic": {"id": "root", "title": "R", "children": {"attached": [
+            {"id": "a1", "title": "A"},
+            {"id": "a2", "title": "A", "children": {
+                "attached": [{"id": "x", "title": "X"}],
+                "summary": [{"id": "sum-topic", "title": "概要"}],
+            }},
+        ]}},
+    }]
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("content.json", json.dumps(content, ensure_ascii=False))
+
+    writer = XMindWriter(parse_xmind(path))
+    writer.merge_duplicate_nodes()
+    keep = writer.xm.find_topic("a1")._raw
+    assert any(c["id"] == "x" for c in keep["children"]["attached"])
+    assert "summary" not in keep["children"]
+
+
 def test_duplicate_node_to_descendant_raises(sample_xmind: Path):
     xm = parse_xmind(sample_xmind)
     writer = XMindWriter(xm)
@@ -319,6 +377,33 @@ def test_set_sheet_layout(sample_xmind: Path):
     assert ok
     assert xm.sheets[0].root.structure_class == "org.xmind.ui.logic.right"
     assert xm.raw_content[0]["rootTopic"]["structureClass"] == "org.xmind.ui.logic.right"
+
+
+def test_set_sheet_layout_preserves_unrelated_extensions(tmp_path: Path):
+    """切换表格布局时只替换 spreadsheet 扩展，不能吞掉根主题的其他扩展。"""
+    import zipfile
+
+    path = tmp_path / "ext.xmind"
+    content = [{
+        "id": "s", "title": "S",
+        "rootTopic": {
+            "id": "root", "title": "R",
+            "extensions": [{"provider": "com.example.custom", "content": {}}],
+        },
+    }]
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("content.json", json.dumps(content, ensure_ascii=False))
+
+    xm = parse_xmind(path)
+    writer = XMindWriter(xm)
+
+    writer.set_sheet_layout(0, "矩阵图")
+    providers = [e.get("provider") for e in xm.raw_content[0]["rootTopic"]["extensions"]]
+    assert providers == ["com.example.custom", "org.xmind.ui.spreadsheet"]
+
+    writer.set_sheet_layout(0, "逻辑图")
+    providers = [e.get("provider") for e in xm.raw_content[0]["rootTopic"]["extensions"]]
+    assert providers == ["com.example.custom"]
 
 
 def test_add_image(sample_xmind: Path, tmp_path: Path):
@@ -708,6 +793,27 @@ def test_removed_attachment_also_leaves_manifest(tmp_path: Path):
     assert "attachments/images/unused.png" not in saved_manifest["file-entries"]
 
 
+def test_remove_unused_attachments_keeps_referenced_xap_image(tmp_path: Path):
+    """xap:images/a.png 实际存在 attachments/images/a.png，不能误判为未引用。"""
+    import zipfile
+
+    path = tmp_path / "ref.xmind"
+    content = [{
+        "id": "s", "title": "S",
+        "rootTopic": {"id": "root", "title": "R", "children": {"attached": [
+            {"id": "c1", "title": "C1", "image": {"src": "xap:images/used.png"}},
+        ]}},
+    }]
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("content.json", json.dumps(content, ensure_ascii=False))
+        zf.writestr("attachments/images/used.png", b"used")
+        zf.writestr("attachments/images/unused.png", b"unused")
+
+    writer = XMindWriter(parse_xmind(path))
+    removed = writer.remove_unused_attachments()
+    assert removed == ["attachments/images/unused.png"]
+
+
 def test_save_detects_external_change(sample_xmind: Path):
     """解析之后文件被别人改过，保存必须中止，不能覆盖对方。"""
     writer = XMindWriter(parse_xmind(sample_xmind))
@@ -785,7 +891,7 @@ def test_new_topics_follow_xmind_official_schema(sample_xmind: Path):
 
 def test_created_file_follows_xmind_official_schema(tmp_path: Path):
     path = tmp_path / "created.xmind"
-    writer = XMindWriter.create(
+    XMindWriter.create(
         path,
         "根主题",
         topics=[{"title": "子节点", "children": [{"title": "孙节点"}]}],

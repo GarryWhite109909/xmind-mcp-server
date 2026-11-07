@@ -36,6 +36,20 @@ def test_find_topics_with_image_no_images(sample_xmind: Path):
     assert xm.find_topics_with_image() == []
 
 
+def test_parse_markers_accepts_legacy_dict_shape(tmp_path: Path):
+    """旧结构 markers={"markerId": "priority-1"} 也要归一化成列表。"""
+    path = tmp_path / "markers.xmind"
+    content = [{"id": "s", "title": "S", "rootTopic": {
+        "id": "root", "title": "R",
+        "markers": {"markerId": "priority-1"},
+    }}]
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("content.json", json.dumps(content, ensure_ascii=False))
+
+    node = parse_xmind(path).sheets[0].root
+    assert node.markers == ["priority-1"]
+
+
 def test_old_xml_format_raises(tmp_path: Path):
     path = tmp_path / "old.xmind"
     with zipfile.ZipFile(path, "w") as zf:

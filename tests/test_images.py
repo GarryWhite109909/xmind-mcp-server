@@ -11,7 +11,6 @@ from PIL import Image
 
 from xmind_mcp.config import Config
 from xmind_mcp.image_payload import prepare_image
-from xmind_mcp.ocr.base import OcrResult
 from xmind_mcp.tools import XMindTools
 from xmind_mcp.xmind_parser import parse_xmind
 from xmind_mcp.xmind_writer import XMindWriter
@@ -19,7 +18,7 @@ from xmind_mcp.xmind_writer import XMindWriter
 
 @pytest.fixture
 def config() -> Config:
-    return Config(ocr_engine="rapidocr", device="cpu", initialized=True)
+    return Config()
 
 
 def _png(width: int = 64, height: int = 48, color=(220, 60, 60)) -> bytes:
@@ -173,19 +172,18 @@ async def test_read_all_inlines_images_by_default(config: Config, tmp_path: Path
     assert any(b.type == "image" for b in blocks[1:])
 
 
-async def test_read_all_ocr_mode_stays_text_only(config: Config, tmp_path: Path):
-    path = _make_xmind(tmp_path / "ocr.xmind", image=_png(400, 300))
+async def test_read_all_legacy_ocr_mode_falls_back_to_inline(
+    config: Config, tmp_path: Path
+):
+    """旧客户端还传 image_mode=ocr 时，不再报错，按默认 inline 返回原图。"""
+    path = _make_xmind(tmp_path / "legacy.xmind", image=_png(400, 300))
     tools = XMindTools(config)
-    tools.ocr.recognize = lambda image, use_cache=True: OcrResult(
-        text="识别出的文字", lines=[], elapsed=0.0
-    )
 
     blocks = await tools.call_tool(
         "read_all", {"file_path": str(path), "image_mode": "ocr"}
     )
-    assert len(blocks) == 1
-    assert blocks[0].type == "text"
-    assert "识别出的文字" in blocks[0].text
+    assert len(blocks) >= 2
+    assert any(b.type == "image" for b in blocks[1:])
 
 
 async def test_read_all_respects_max_images(config: Config, tmp_path: Path):

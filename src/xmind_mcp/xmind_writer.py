@@ -24,7 +24,14 @@ from typing import Optional, Union
 
 from . import __version__
 from .config import BACKUP_DIR
-from .xmind_parser import XMindFile, TopicNode, parse_xmind, topic_ids_in_subtree
+from .xmind_parser import (
+    XMindFile,
+    TopicNode,
+    collect_xap_refs,
+    parse_xmind,
+    resolve_xap_entry,
+    topic_ids_in_subtree,
+)
 from .xmind_props import (
     ARROW_ENDS,
     BORDER_PATTERNS,
@@ -114,6 +121,13 @@ DEFAULT_METADATA: dict = {
 
 class FileChangedError(RuntimeError):
     """保存前发现文件已被其他程序修改，拒绝覆盖。"""
+
+
+def _same_path(a: Union[str, Path], b: Union[str, Path]) -> bool:
+    """比较两个路径是否指向同一文件（Windows 下大小写不敏感）。"""
+    return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(
+        os.path.abspath(str(b))
+    )
 
 
 def file_digest(path: str) -> Optional[str]:
@@ -235,6 +249,8 @@ def _existing_marker_ids(topic_dict: dict) -> list[str]:
     markers = topic_dict.get("markers")
     if isinstance(markers, dict):
         markers = markers.get("markerId")
+    if isinstance(markers, str):
+        return [markers] if markers else []
     ids: list[str] = []
     if isinstance(markers, list):
         for entry in markers:
@@ -254,23 +270,36 @@ def _drop_plain_topic_class(topic_dict: dict) -> None:
         topic_dict.pop("class", None)
 
 
+def _backup_prefix(path: str) -> str:
+    """备份文件名前缀：文件名 + 绝对路径哈希。
+
+    只用文件名会让不同目录下的同名文件共用备份池，既互相挤占 20 份配额，
+    也可能恢复成另一份文件。路径哈希只用于区分，不泄露目录结构。
+    """
+    stem = Path(path).stem
+    digest = hashlib.sha256(
+        os.path.normcase(os.path.abspath(path)).encode("utf-8")
+    ).hexdigest()[:10]
+    return f"{stem}-{digest}"
+
+
 def _backup_file(path: str) -> Optional[str]:
     """覆盖保存前把原文件备份到 ~/.xmind-mcp/backups/，每个文件保留最近 20 份。"""
     try:
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        stem = Path(path).stem
+        prefix = _backup_prefix(path)
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        dest = BACKUP_DIR / f"{stem}-{timestamp}.xmind"
+        dest = BACKUP_DIR / f"{prefix}-{timestamp}.xmind"
         # 同一秒内多次备份时避免文件名冲突（否则会互相覆盖）
         counter = 1
         while dest.exists():
-            dest = BACKUP_DIR / f"{stem}-{timestamp}-{counter}.xmind"
+            dest = BACKUP_DIR / f"{prefix}-{timestamp}-{counter}.xmind"
             counter += 1
         shutil.copyfile(path, dest)
 
-        # 只保留最近 20 份同名备份
+        # 只保留最近 20 份同一文件的备份
         backups = sorted(
-            BACKUP_DIR.glob(f"{stem}-*.xmind"),
+            BACKUP_DIR.glob(f"{prefix}-*.xmind"),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
@@ -282,14 +311,21 @@ def _backup_file(path: str) -> Optional[str]:
         return None
 
 
+def _backup_glob(file_path: str) -> str:
+    """备份文件的 glob；兼容 0.4 及以前按文件名平铺的旧备份。"""
+    prefix = _backup_prefix(file_path)
+    if any(BACKUP_DIR.glob(f"{prefix}-*.xmind")):
+        return f"{prefix}-*.xmind"
+    return f"{Path(file_path).stem}-*.xmind"
+
+
 def list_backups(file_path: str) -> list[dict]:
     """列出某个 xmind 文件已有的自动备份（新到旧）。"""
-    stem = Path(file_path).stem
     backups: list[dict] = []
     if not BACKUP_DIR.is_dir():
         return backups
     for p in sorted(
-        BACKUP_DIR.glob(f"{stem}-*.xmind"),
+        BACKUP_DIR.glob(_backup_glob(file_path)),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     ):
@@ -330,31 +366,43 @@ def _find_topic_and_parent(
     def _search(
         topic: dict,
         parent: Optional[dict],
+        kind: Optional[str],
     ) -> tuple[Optional[dict], Optional[dict], Optional[str]]:
+        if not isinstance(topic, dict):
+            return (None, None, None)
         if topic.get("id") == topic_id:
-            return (topic, parent, None)
-        children = topic.get("children", {})
-        for key in ("attached", "detached", "summary", "callout"):
-            for child in children.get(key, []):
-                if child.get("id") == topic_id:
-                    return (child, topic, key)
-                found = _search(child, topic)
+            return (topic, parent, kind)
+        children = topic.get("children")
+        if not isinstance(children, dict):
+            return (None, None, None)
+        for child_key in ("attached", "detached", "summary", "callout"):
+            for child in children.get(child_key, []):
+                found = _search(child, topic, child_key)
                 if found[0] is not None:
                     return found
         return (None, None, None)
 
     for sheet in raw_content:
-        root = sheet.get("rootTopic", {})
-        if root.get("id") == topic_id:
-            return (root, None, None)
-        for key in ("attached", "detached", "summary", "callout"):
-            for child in root.get("children", {}).get(key, []):
-                if child.get("id") == topic_id:
-                    return (child, root, key)
-        found = _search(root, None)
+        if not isinstance(sheet, dict):
+            continue
+        found = _search(sheet.get("rootTopic", {}), None, None)
         if found[0] is not None:
             return found
     return (None, None, None)
+
+
+def _is_descendant(topic: dict, target_id: str) -> bool:
+    """target_id 是否在 topic 的子树中（用于阻止把节点移到/复制到自己下面）。"""
+    children = topic.get("children") if isinstance(topic, dict) else None
+    if not isinstance(children, dict):
+        return False
+    for key in ("attached", "detached", "summary", "callout"):
+        for child in children.get(key, []):
+            if not isinstance(child, dict):
+                continue
+            if child.get("id") == target_id or _is_descendant(child, target_id):
+                return True
+    return False
 
 
 def _set_notes(topic_dict: dict, notes: str) -> None:
@@ -723,16 +771,6 @@ class XMindWriter:
             raise ValueError("插入位置节点无效：不能以自身为位置参考")
 
         # 不能移动到自己或自己的后代下
-        def _is_descendant(parent: dict, child_id: str) -> bool:
-            children = parent.get("children", {})
-            for key in ("attached", "detached", "summary", "callout"):
-                for child in children.get(key, []):
-                    if child.get("id") == child_id:
-                        return True
-                    if _is_descendant(child, child_id):
-                        return True
-            return False
-
         if new_parent_id == node_id or _is_descendant(topic_dict, new_parent_id):
             raise ValueError("不能把节点移动到自己或自己的后代下")
 
@@ -810,23 +848,21 @@ class XMindWriter:
             raise ValueError("不能把节点复制到概要(summary)或批注(callout)节点下")
 
         # 不能复制到自己或自己的后代下（否则会生成自嵌套的畸形树）
-        def _is_descendant(parent: dict, child_id: str) -> bool:
-            children = parent.get("children", {})
-            for key in ("attached", "detached", "summary", "callout"):
-                for child in children.get(key, []):
-                    if child.get("id") == child_id:
-                        return True
-                    if _is_descendant(child, child_id):
-                        return True
-            return False
-
         if new_parent_id == node_id or _is_descendant(topic_dict, new_parent_id):
             raise ValueError("不能把节点复制到自己或自己的后代下")
 
-        # 深拷贝并重新生成所有子节点 ID
+        # 深拷贝并重新生成整棵子树的 ID。先把旧 ID → 新 ID 的映射记下来，
+        # 再把 summaries[].topicId 之类的内部引用一起改掉，否则复制出来的
+        # 概要会指向原节点里已经不存在的 summary topic。
+        id_map: dict[str, str] = {}
+
         def _rewrite_ids(topic: dict) -> dict:
             new_topic = copy.deepcopy(topic)
-            new_topic["id"] = str(uuid.uuid4())
+            old_id = topic.get("id")
+            new_id = str(uuid.uuid4())
+            new_topic["id"] = new_id
+            if old_id:
+                id_map[old_id] = new_id
             children = new_topic.get("children", {})
             if isinstance(children, dict):
                 for key in ("attached", "detached", "summary", "callout"):
@@ -835,7 +871,23 @@ class XMindWriter:
                         children[key] = [_rewrite_ids(c) for c in lst]
             return new_topic
 
+        def _remap_refs(topic: dict) -> None:
+            summaries = topic.get("summaries")
+            if isinstance(summaries, list):
+                for item in summaries:
+                    if isinstance(item, dict):
+                        ref = item.get("topicId")
+                        if ref in id_map:
+                            item["topicId"] = id_map[ref]
+            children = topic.get("children", {})
+            if isinstance(children, dict):
+                for key in ("attached", "detached", "summary", "callout"):
+                    for child in children.get(key, []):
+                        if isinstance(child, dict):
+                            _remap_refs(child)
+
         copied = _rewrite_ids(topic_dict)
+        _remap_refs(copied)
         attached_list = _ensure_children_attached(new_parent_dict)
         attached_list.append(copied)
 
@@ -901,8 +953,19 @@ class XMindWriter:
             return False
         resolved = resolve(STRUCTURES, layout, label="布局结构")
         root["structureClass"] = resolved
+
+        # 只替换 spreadsheet 那份扩展，保留根主题上的其他扩展
+        extensions = root.get("extensions")
+        extensions = extensions if isinstance(extensions, list) else []
+        extensions = [
+            entry for entry in extensions
+            if not (
+                isinstance(entry, dict)
+                and entry.get("provider") == "org.xmind.ui.spreadsheet"
+            )
+        ]
         if resolved == "org.xmind.ui.spreadsheet":
-            root["extensions"] = [{
+            extensions.append({
                 "provider": "org.xmind.ui.spreadsheet",
                 "content": [{
                     "name": "columns",
@@ -911,7 +974,9 @@ class XMindWriter:
                         for i in range(1, 6)
                     ] + [{"name": "leading-column", "content": ""}],
                 }],
-            }]
+            })
+        if extensions:
+            root["extensions"] = extensions
         else:
             root.pop("extensions", None)
         self.xm.refresh_from_raw()
@@ -1299,7 +1364,10 @@ class XMindWriter:
     def _add_label_to_topic(topic_dict: dict, label: str) -> None:
         """直接给 topic dict 加标签（批量操作内部使用，不刷新解析树）。"""
         labels = topic_dict.get("labels")
-        if not isinstance(labels, list):
+        if isinstance(labels, str):
+            labels = [labels]
+            topic_dict["labels"] = labels
+        elif not isinstance(labels, list):
             labels = []
             topic_dict["labels"] = labels
         if label not in labels:
@@ -1319,8 +1387,10 @@ class XMindWriter:
     def _remove_label_from_topic(topic_dict: dict, label: str) -> None:
         """直接移除 topic dict 上的标签（批量操作内部使用，不刷新解析树）。"""
         labels = topic_dict.get("labels")
+        if isinstance(labels, str):
+            labels = [labels]
         if isinstance(labels, list):
-            topic_dict["labels"] = [l for l in labels if l != label]
+            topic_dict["labels"] = [item for item in labels if item != label]
             if not topic_dict["labels"]:
                 topic_dict.pop("labels", None)
 
@@ -1340,7 +1410,7 @@ class XMindWriter:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
         original_path = self.xm.path
-        overwriting = os.path.abspath(output_path) == os.path.abspath(original_path)
+        overwriting = _same_path(output_path, original_path)
         if overwriting and Path(original_path).exists():
             # 解析之后文件被别人（XMind 本体、另一个 MCP 进程）改过时，
             # 直接覆盖会静默丢掉对方的修改，这里宁可报错让调用方决策。
@@ -1369,7 +1439,8 @@ class XMindWriter:
             zin = None
 
         dropped_preview = False
-        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zout:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zout:
             written: set[str] = set()
             manifest: dict = {}
             if zin is not None:
@@ -1389,6 +1460,8 @@ class XMindWriter:
                             try:
                                 manifest = json.loads(zin.read(item.filename))
                             except (json.JSONDecodeError, KeyError):
+                                manifest = {}
+                            if not isinstance(manifest, dict):
                                 manifest = {}
                         else:
                             zout.writestr(item, zin.read(item.filename))
@@ -1421,14 +1494,19 @@ class XMindWriter:
                     written.add(name)
 
             # manifest 登记所有文件（目录项不登记）
-            entries = manifest.setdefault("file-entries", {})
+            entries = manifest.get("file-entries")
+            if not isinstance(entries, dict):
+                entries = {}
+                manifest["file-entries"] = entries
             for name in written:
                 if name != "manifest.json" and not name.endswith("/"):
                     entries.setdefault(name, {})
             # 没写进新 zip 的条目不能继续留在 manifest 里，
             # 否则 XMind 会以为附件还在（旧缩略图同理）
-            dropped = set(self._exclude_files)
-            for name in [n for n in entries if n in dropped or _is_preview_asset(n)]:
+            for name in [
+                n for n in entries
+                if n not in written and not n.endswith("/")
+            ]:
                 entries.pop(name, None)
             zout.writestr(
                 "manifest.json",
@@ -1437,16 +1515,30 @@ class XMindWriter:
 
         self.dropped_preview = dropped_preview
 
+        # 原子写盘：先写同目录临时文件，再整体替换。中途崩溃或磁盘写满
+        # 时原文件保持完整，不会留下半个打不开的 xmind。
+        data = buffer.getvalue()
+        tmp_path = f"{output_path}.tmp-{uuid.uuid4().hex}"
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+            os.replace(tmp_path, output_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
         # 更新内部缓存
-        with open(output_path, "rb") as f:
-            self.xm._zip_bytes = f.read()
+        self.xm._zip_bytes = data
         # 关键：只有覆盖原文件时才更新 path。
         # 如果另存到新路径而把 path 改掉，缓存里原路径的 writer 会指向新文件，
         # 用户后续“保存原文件”会静默写到别处。
         if overwriting:
             self.xm.path = output_path
             # 刚写入的内容就是新的基准，否则下一次保存会误判为冲突
-            self.xm.source_digest = hashlib.sha256(self.xm._zip_bytes).hexdigest()
+            self.xm.source_digest = hashlib.sha256(data).hexdigest()
 
         return output_path
 
@@ -1648,7 +1740,10 @@ class XMindWriter:
                             if not isinstance(keep_children, dict):
                                 keep_children = {}
                                 keep["children"] = keep_children
-                            for key in ("attached", "detached", "summary", "callout"):
+                            # 只并入普通子节点。summary/callout 是挂在被删节点上的
+                            # 视觉元素，连同它的 summaries 元数据一起消失才一致；
+                            # 单独搬过去会变成没有 range 指向的孤儿节点。
+                            for key in ("attached", "detached"):
                                 items = dup_children.get(key, [])
                                 if items:
                                     keep_children.setdefault(key, []).extend(items)
@@ -1777,35 +1872,25 @@ class XMindWriter:
 
     def remove_unused_attachments(self) -> list[str]:
         """找出 zip 中未被任何节点引用的附件/图片，保存时移除。返回移除列表。"""
-        referenced: set[str] = set()
-
-        def _walk(topic: dict) -> None:
-            image = topic.get("image")
-            if isinstance(image, dict):
-                src = image.get("src") or ""
-                if src.startswith("xap:"):
-                    referenced.add(src[4:])
-            children = topic.get("children", {})
-            if isinstance(children, dict):
-                for key in ("attached", "detached", "summary", "callout"):
-                    for child in children.get(key, []):
-                        if isinstance(child, dict):
-                            _walk(child)
-
-        for sheet in self.xm.raw_content:
-            root = sheet.get("rootTopic") if isinstance(sheet, dict) else None
-            if isinstance(root, dict):
-                _walk(root)
+        referenced = collect_xap_refs(self.xm.raw_content)
 
         unused: list[str] = []
         if self.xm._zip_bytes:
             try:
                 with zipfile.ZipFile(io.BytesIO(self.xm._zip_bytes)) as zf:
-                    for name in zf.namelist():
-                        if name.endswith("/"):
-                            continue
-                        if name.startswith(("attachments/", "resources/")) and name not in referenced:
-                            unused.append(name)
+                    names = {name for name in zf.namelist() if not name.endswith("/")}
+                    # 引用路径可能写成 xap:images/x.png，但 zip 里实际存放在
+                    # attachments/images/x.png；必须按真实条目比对，否则会误删在用资源。
+                    referenced_entries = {
+                        entry
+                        for src in referenced
+                        if (entry := resolve_xap_entry(src, names))
+                    }
+                    unused = sorted(
+                        name for name in names
+                        if name.startswith(("attachments/", "resources/"))
+                        and name not in referenced_entries
+                    )
             except zipfile.BadZipFile:
                 pass
         self._exclude_files.update(unused)
@@ -1904,8 +1989,18 @@ class XMindWriter:
         # 覆盖已有文件前先备份，和 save() 的行为保持一致
         if Path(output_path).exists():
             _backup_file(output_path)
-        with open(output_path, "wb") as f:
-            f.write(zip_bytes.getvalue())
+        data = zip_bytes.getvalue()
+        tmp_path = f"{output_path}.tmp-{uuid.uuid4().hex}"
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+            os.replace(tmp_path, output_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
         xm = XMindFile(
             path=output_path,
@@ -1918,7 +2013,8 @@ class XMindWriter:
                 "content.xml",
                 "manifest.json",
             ],
-            _zip_bytes=zip_bytes.getvalue(),
+            _zip_bytes=data,
+            source_digest=hashlib.sha256(data).hexdigest(),
         )
         xm.refresh_from_raw()
         return cls(xm)

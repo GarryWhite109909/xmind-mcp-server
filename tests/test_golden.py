@@ -16,8 +16,9 @@ from pathlib import Path
 
 import pytest
 
+from xmind_mcp.markdown_import import _parse_markdown_outline
 from xmind_mcp.config import Config
-from xmind_mcp.tools import XMindTools, _parse_markdown_outline
+from xmind_mcp.tools import XMindTools
 from xmind_mcp.xmind_parser import parse_xmind
 from xmind_mcp.xmind_writer import XMindWriter
 
@@ -29,7 +30,7 @@ PNG_B64 = (
 
 @pytest.fixture
 def config() -> Config:
-    return Config(ocr_engine="rapidocr", device="cpu", initialized=True)
+    return Config()
 
 # ---- golden 常量（取自 tests/对比.xmind）----
 MATRIX_STRUCTURE_CLASS = "org.xmind.ui.spreadsheet"

@@ -102,13 +102,21 @@ class XMindFile:
     _zip_bytes: Optional[bytes] = field(default=None, repr=False)
     # 解析时文件的 SHA256，保存前用于发现“别人改过这个文件”
     source_digest: str = ""
+    # 节点索引缓存：refresh_from_raw 后重建，find_topic 从 O(n) 降到 O(1)
+    _topic_index: dict[str, TopicNode] = field(default_factory=dict, repr=False)
+    _topics_cache: list[TopicNode] = field(default_factory=list, repr=False)
+
+    def _reindex(self) -> None:
+        """重建节点列表和 ID 索引。"""
+        topics: list[TopicNode] = []
+        for sheet in self.sheets:
+            self._collect(sheet.root, topics)
+        self._topics_cache = topics
+        self._topic_index = {t.id: t for t in topics if t.id}
 
     def all_topics(self) -> list[TopicNode]:
-        """遍历所有工作表的所有节点。"""
-        result = []
-        for sheet in self.sheets:
-            self._collect(sheet.root, result)
-        return result
+        """遍历所有工作表的所有节点（返回副本，避免调用方改动缓存）。"""
+        return list(self._topics_cache)
 
     @staticmethod
     def _collect(node: TopicNode, out: list[TopicNode]) -> None:
@@ -118,10 +126,7 @@ class XMindFile:
 
     def find_topic(self, topic_id: str) -> Optional[TopicNode]:
         """按 ID 查找节点。"""
-        for topic in self.all_topics():
-            if topic.id == topic_id:
-                return topic
-        return None
+        return self._topic_index.get(topic_id)
 
     def find_topics_with_image(self) -> list[TopicNode]:
         """找出所有有图片的节点。"""
@@ -143,6 +148,7 @@ class XMindFile:
                 title=sheet_dict.get("title", ""),
                 root=root_node,
             ))
+        self._reindex()
 
 
 # ---------- 解析逻辑 ----------
@@ -169,9 +175,14 @@ def _parse_markers(topic_dict: dict) -> list[str]:
     if not markers:
         return []
     if isinstance(markers, dict):
-        return markers.get("markerId", [])
+        markers = markers.get("markerId", [])
+    if isinstance(markers, str):
+        return [markers] if markers else []
     if isinstance(markers, list):
-        return [m.get("markerId", "") if isinstance(m, dict) else str(m) for m in markers]
+        return [
+            str(m["markerId"]) if isinstance(m, dict) and m.get("markerId") else str(m)
+            for m in markers
+        ]
     return []
 
 
@@ -223,7 +234,7 @@ def _parse_topic(
         id=topic_dict.get("id", ""),
         # 兼容标题为 null 的畸形文件：统一归一化为空字符串，
         # 避免 find_node / analyze_file / apply_matching 等下游直接 .lower()/.strip() 崩溃
-        title=topic_dict.get("title") or "",
+        title=str(topic_dict.get("title") or ""),
         level=level,
         sheet_index=sheet_index,
         topic_class=topic_class,
@@ -270,6 +281,49 @@ def _resolve_image_path(src: str) -> str:
     return src
 
 
+def _xap_entry_candidates(src: str) -> list[str]:
+    """列出 xap: 引用可能对应的 zip 路径（兼容不同版本的存储位置）。"""
+    if not src or src.startswith("data:"):
+        return []
+    zip_path = _resolve_image_path(src)
+    filename = Path(zip_path).name
+    candidates = [
+        zip_path,
+        src,
+        f"attachments/{zip_path}",
+        f"attachments/{src}",
+        f"attachments/images/{filename}",
+        f"resources/{filename}",
+    ]
+    return list(dict.fromkeys(candidates))
+
+
+def resolve_xap_entry(src: str, names: set[str]) -> Optional[str]:
+    """把 xap: 引用解析成 zip 内真实文件名；找不到返回 None。"""
+    for candidate in _xap_entry_candidates(src):
+        if candidate in names:
+            return candidate
+    return None
+
+
+def collect_xap_refs(value: object) -> set[str]:
+    """收集 content.json 里所有 xap: 引用（图片、附件、超链接都可能用）。"""
+    refs: set[str] = set()
+
+    def _walk(item: object) -> None:
+        if isinstance(item, dict):
+            for child in item.values():
+                _walk(child)
+        elif isinstance(item, list):
+            for child in item:
+                _walk(child)
+        elif isinstance(item, str) and item.startswith("xap:"):
+            refs.add(item[4:])
+
+    _walk(value)
+    return refs
+
+
 def load_image_data(src: str, zf: zipfile.ZipFile) -> Optional[bytes]:
     """从 zip 中读取图片二进制，支持内嵌 base64 和附件引用。"""
     if not src:
@@ -283,26 +337,8 @@ def load_image_data(src: str, zf: zipfile.ZipFile) -> Optional[bytes]:
             return base64.b64decode(match.group(1))
         return None
 
-    zip_path = _resolve_image_path(src)
-    try:
-        return zf.read(zip_path)
-    except KeyError:
-        # 尝试其他可能路径（兼容不同 XMind 版本的存储位置）
-        filename = Path(zip_path).name
-        candidates = [
-            zip_path,
-            src,
-            f"attachments/{zip_path}",
-            f"attachments/{src}",
-            f"attachments/images/{filename}",
-            f"resources/{filename}",
-        ]
-        for candidate in candidates:
-            try:
-                return zf.read(candidate)
-            except KeyError:
-                continue
-        return None
+    entry = resolve_xap_entry(src, set(zf.namelist()))
+    return zf.read(entry) if entry else None
 
 
 def parse_xmind(file_path: Union[str, Path]) -> XMindFile:
@@ -322,19 +358,19 @@ def parse_xmind(file_path: Union[str, Path]) -> XMindFile:
     with open(file_path, "rb") as f:
         zip_bytes = f.read()
 
-    zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
-    namelist = zf.namelist()
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        namelist = zf.namelist()
 
-    # 检测格式
-    if "content.json" not in namelist:
-        if "content.xml" in namelist:
-            raise ValueError(
-                "检测到旧版 XMind 8 格式（content.xml），当前仅支持新版 JSON 格式。"
-                "请在 XMind 2020+ 中另存为新格式。"
-            )
-        raise ValueError(f"不是有效的 XMind 文件：缺少 content.json，内部文件: {namelist}")
+        # 检测格式
+        if "content.json" not in namelist:
+            if "content.xml" in namelist:
+                raise ValueError(
+                    "检测到旧版 XMind 8 格式（content.xml），当前仅支持新版 JSON 格式。"
+                    "请在 XMind 2020+ 中另存为新格式。"
+                )
+            raise ValueError(f"不是有效的 XMind 文件：缺少 content.json，内部文件: {namelist}")
 
-    content_raw = json.loads(zf.read("content.json"))
+        content_raw = json.loads(zf.read("content.json"))
     if isinstance(content_raw, dict):
         content_raw = [content_raw]
 
@@ -353,7 +389,7 @@ def parse_xmind(file_path: Union[str, Path]) -> XMindFile:
             root=root_node,
         ))
 
-    return XMindFile(
+    xm = XMindFile(
         path=file_path,
         sheets=sheets,
         raw_content=content_raw,
@@ -361,6 +397,8 @@ def parse_xmind(file_path: Union[str, Path]) -> XMindFile:
         _zip_bytes=zip_bytes,
         source_digest=hashlib.sha256(zip_bytes).hexdigest(),
     )
+    xm._reindex()
+    return xm
 
 
 def load_preview_image(xm: XMindFile) -> Optional[bytes]:
@@ -391,8 +429,10 @@ def load_topic_image(topic: TopicNode, xm: XMindFile) -> Optional[bytes]:
     if topic.image_data is not None:
         return topic.image_data
 
-    zf = zipfile.ZipFile(io.BytesIO(xm._zip_bytes))
-    data = load_image_data(topic.image_src, zf)
+    if not xm._zip_bytes:
+        return None
+    with zipfile.ZipFile(io.BytesIO(xm._zip_bytes)) as zf:
+        data = load_image_data(topic.image_src, zf)
     topic.image_data = data  # 缓存到节点上
     return data
 

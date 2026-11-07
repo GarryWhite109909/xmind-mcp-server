@@ -10,30 +10,9 @@ mathtext 支持大多数常用数学语法（分数、根号、求和、积分�
 from __future__ import annotations
 
 import logging
-import re
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger("xmind_mcp.formula")
-
-# 块级公式：整段被 $$ ... $$ 包裹。支持多行。
-_BLOCK_EQ_RE = re.compile(r"^\$\$(.*?)\$\$", re.DOTALL)
-# 单行块级公式：$$...$$
-_SINGLE_LINE_RE = re.compile(r"^\$\$(.+)\$\$\s*$")
-
-
-def is_block_equation_start(line: str) -> bool:
-    """判断一行是否为块级公式的开头（$$ 结束在本行或需要续行）。"""
-    stripped = line.strip()
-    return stripped.startswith("$$")
-
-
-def try_extract_single_line(latex: str) -> Optional[str]:
-    """去掉包裹的 $$，返回公式体；不是合法块级公式则返回 None。"""
-    m = _SINGLE_LINE_RE.match(latex.strip())
-    if m:
-        return m.group(1).strip()
-    return None
 
 
 def render_latex_png(latex: str, out_path: "str | Path", fontsize: float = 20, dpi: int = 200) -> bool:
@@ -47,6 +26,8 @@ def render_latex_png(latex: str, out_path: "str | Path", fontsize: float = 20, d
     Returns:
         是否渲染成功。失败时不会创建（或留下空）文件，并打日志。
     """
+    fig = None
+    plt = None
     try:
         import matplotlib
 
@@ -67,7 +48,6 @@ def render_latex_png(latex: str, out_path: "str | Path", fontsize: float = 20, d
             pad_inches=0.05,
             transparent=True,
         )
-        plt.close(fig)
         return True
     except Exception as exc:  # mathtext 不支持某些命令时抛异常
         logger.warning("公式渲染失败，保留 LaTeX 文本: %s (%s: %s)", latex, type(exc).__name__, exc)
@@ -78,3 +58,10 @@ def render_latex_png(latex: str, out_path: "str | Path", fontsize: float = 20, d
         except Exception:
             pass
         return False
+    finally:
+        # 成功和失败都释放 figure，避免批量导入时累积内存
+        if fig is not None and plt is not None:
+            try:
+                plt.close(fig)
+            except Exception:
+                pass
